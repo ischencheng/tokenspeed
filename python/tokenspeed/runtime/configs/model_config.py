@@ -957,6 +957,12 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
+        # Value head width. The MLA/DSA hooks and MHA models whose value heads
+        # are narrower than their query/key heads (MiMo-V2) set it below.
+        self.v_head_dim = self.head_dim
+        # Per-layer KV head counts when layers differ (MiMo-V2's full and
+        # sliding layers); None when every layer has num_key_value_heads.
+        self.layer_num_key_value_heads: tuple[int, ...] | None = None
 
         # Storage of the DSA index-key plane, one of INDEX_K_FORMATS
         # (layers/attention/configs/dsa.py). A DSA model's configure-attention
