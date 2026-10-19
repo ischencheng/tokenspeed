@@ -133,6 +133,7 @@ def _device_handle(runner, drafter=None) -> DeviceHandle:
 
 def _handler(device) -> RequestHandler:
     handler = RequestHandler.__new__(RequestHandler)
+    handler.memory_controller = None
     handler.send_func = mock.Mock()
     handler.server_args = mock.Mock(weight_version="v1", kvstore_storage_backend=None)
     handler._device = device
@@ -324,8 +325,7 @@ class TestRealCheckpoint:
         assert (runner.model_config.model_path) == (str(self.root / "step-1"))
 
     def test_non_unit_kv_scale_fails_the_update(self):
-        # The startup loader's screen applies to a reload: KV caches run at
-        # unit scale.
+        # A reload keeps the startup KV-cache scales, as a distributed update does.
         directory = self.root / "scaled"
         directory.mkdir()
         save_file(

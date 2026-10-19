@@ -46,6 +46,7 @@ from tokenspeed.runtime.configs.numerics import (
     YARN_RAMP_MASK_DEVICES,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.metrics.config import resolve_metrics_options
 from tokenspeed.runtime.moe.dispatch_algorithm import (
     EP_DISPATCH_ALGORITHMS,
     STATIC_EP_DISPATCH_ALGORITHMS,
@@ -214,31 +215,26 @@ def kernel_override_env_key(family: str, mode: str) -> str:
 
 
 def validate_context_parallel_roles(
-    *, kvp_size: int, dcp_size: int, qcp_size: int, disaggregation_mode: str
+    *,
+    kvp_size: int,
+    dcp_size: int,
+    qcp_size: int,
+    disaggregation_mode: str,
+    enable_mixed_batch: bool,
 ) -> None:
-    """Pin the three context-parallel sizes to the PD roles that serve them.
+    """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
 
-    KVP (``--kv-parallel-size``) is the storage layout: a PD prefill or decode
-    engine shards its pages (a transfer edge copies only the pages both its
-    ranks own, so the two caches shard independently); an aggregated engine
-    does not, because reading a sharded cache in steady-state decode is the
-    decode role's compute below. DCP (``--decode-context-parallel-size``)
-    names that compute -- attend the owned pages, merge the partials by LSE
-    -- and is the only way a decode engine reads a sharded cache, so on the
-    decode role the two sizes come together and equal. QCP
-    (``--query-context-parallel-size``) names the prefill role's query-row
-    sharding over the same sharded pages; a prefill engine may also shard
-    its pages without it (chunked history gather).
+    Aggregated and PD decode engines require explicit DCP matching KVP.
+    Aggregated DCP requires separate prefill and decode rounds.
     """
     if dcp_size < 1:
         raise ValueError(
             f"--decode-context-parallel-size must be a positive integer, got {dcp_size}"
         )
-    if kvp_size > 1 and disaggregation_mode not in ("prefill", "decode"):
+    if kvp_size > 1 and disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(
-            "--kv-parallel-size > 1 requires --disaggregation-mode prefill or "
-            f"decode (got {disaggregation_mode!r}): decode over sharded pages is "
-            "--decode-context-parallel-size, which serves the decode role only"
+            "--kv-parallel-size > 1 requires --disaggregation-mode null, prefill "
+            f"or decode (got {disaggregation_mode!r})"
         )
     if qcp_size > 1:
         if disaggregation_mode != "prefill":
@@ -256,10 +252,10 @@ def validate_context_parallel_roles(
                 "splits by the page owners of the whole shard group"
             )
     if dcp_size > 1:
-        if disaggregation_mode != "decode":
+        if disaggregation_mode not in ("null", "decode"):
             raise ValueError(
                 "--decode-context-parallel-size > 1 requires --disaggregation-mode "
-                f"decode (got {disaggregation_mode!r})"
+                f"null or decode (got {disaggregation_mode!r})"
             )
         if dcp_size != kvp_size:
             raise ValueError(
@@ -268,9 +264,14 @@ def validate_context_parallel_roles(
                 "group owns pages of every request, so all of them merge the "
                 "partials"
             )
-    elif kvp_size > 1 and disaggregation_mode == "decode":
+        if disaggregation_mode == "null" and enable_mixed_batch:
+            raise ValueError(
+                "Aggregated DCP does not support --enable-mixed-batch; "
+                "remove it to schedule prefill and decode separately"
+            )
+    elif kvp_size > 1 and disaggregation_mode in ("null", "decode"):
         raise ValueError(
-            "--kv-parallel-size > 1 on --disaggregation-mode decode requires "
+            f"--kv-parallel-size > 1 on --disaggregation-mode {disaggregation_mode} requires "
             f"--decode-context-parallel-size {kvp_size}: decode over sharded "
             "pages is DCP, and the launch names it explicitly"
         )
@@ -405,6 +406,7 @@ class ServerArgs:
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
+    metrics_reporter_config: str | None = None
     # Port for the engine's Prometheus /metrics HTTP endpoint, served from the
     # engine's main process when --enable-metrics is on. None auto-allocates a
     # free port (logged at startup).
@@ -558,9 +560,9 @@ class ServerArgs:
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
     # KV parallelism: shard the full-history KV pages page-cyclically over a
-    # consecutive subgroup of attention TP (1 = off; PD roles only).
+    # consecutive subgroup of attention TP (1 = off).
     kv_parallel_size: int = 1
-    # Decode context parallelism on the PD decode role: attend the owned
+    # Decode context parallelism in aggregated or PD decode engines: attend owned
     # pages and merge the partials across the KVP group (1 = off; equals
     # kv_parallel_size when on). Names the compute; the backends key the DCP
     # path on the mapping's kvp_size, which the drafter's steps on a sharded
@@ -762,6 +764,7 @@ class ServerArgs:
         self.validate()
 
     def resolve_basic_defaults(self):
+        resolve_metrics_options(self)
         self.model = maybe_model_redirect(self.model)
 
         if self.kv_cache_dtype == "fp8":
@@ -1147,6 +1150,7 @@ class ServerArgs:
             dcp_size=self.decode_context_parallel_size,
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
+            enable_mixed_batch=self.enable_mixed_batch,
         )
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
@@ -1751,12 +1755,11 @@ class ServerArgs:
         """The rl-bitwise block: every envelope beyond auto runs it."""
         # Collectives: one association order per reduction. NCCL's ring
         # chunks by message size, so a plain NCCL sum is run-stable but not
-        # batch-size-invariant; batch_invariant_collectives routes the
-        # all-reduce to the NVLS in-switch reduction with a fixed issuer where
-        # multicast reaches (verified bitwise at startup) and every other
+        # batch-size-invariant; batch_invariant_collectives routes every
         # reduction to the rank-ordered fp32 fold (comm_backend/auto.py).
-        # force_deterministic_rsag stays the user's "NCCL and the fold only"
-        # knob; the envelope does not set it.
+        # Gathers move bytes and keep the multicast kernels;
+        # force_deterministic_rsag, which also moves them to NCCL, stays the
+        # user's knob and the envelope does not set it.
         self.batch_invariant_collectives = True
         self.enable_allreduce_fusion = False
         self.comm_fusion_max_num_tokens = -1
@@ -1819,26 +1822,18 @@ class ServerArgs:
         # Layouts stay explicit: the envelope does not fold them in. A
         # head-sharded o_proj that still sums its head partials across ranks
         # is batch-invariant under the envelope, but its bits are not the
-        # full-K GEMM a replicated or column-parallel o_proj computes, and
-        # they equal a TP-W engine's all-reduced o_proj only when both sides
-        # sum in the same order: the exchanging forward's reduce-scatter
-        # always takes the ordered fold, while an all-reduce (the TP-W
-        # engine's, and the replicated-row decode steps of a query-sharding
-        # engine) takes the in-switch reduction where multicast reaches, whose
-        # order is a property of the GPU set (comm_backend/self_check.py).
-        # --force-deterministic-rsag on the all-reducing side pins it to the
-        # fold; docs/design/numerics.md, "Layout invariance of query context
-        # parallelism".
+        # full-K GEMM a replicated or column-parallel o_proj computes. Every
+        # batch-invariant reduction (the exchanging forward's reduce-scatter,
+        # a TP-W engine's all-reduce) is the same rank-ordered fold, so it does
+        # equal a TP-W engine's all-reduced o_proj; docs/design/numerics.md,
+        # "Layout invariance of query context parallelism".
         if self.mapping.attn.has_head_tp and self.tp_batch_invariant == "none":
             logger.warning(
                 "--numerics rl-bitwise with --attn-head-tp-size > 1 but without "
                 "--tp-batch-invariant attn: the o_proj head partials are summed "
-                "across ranks (the ordered fold for the reduce-scatter, the "
-                "in-switch all-reduce where it applies), which is batch-invariant "
-                "but differs from the full-K o_proj of a TP1 or --tp-batch-invariant "
-                "engine, and equals a TP-W engine's o_proj only when both sides "
-                "sum in the same order (--force-deterministic-rsag on the "
-                "all-reducing side)"
+                "across ranks by the rank-ordered fold, which is batch-invariant "
+                "and equals a TP-W engine's o_proj, but differs from the full-K "
+                "o_proj of a TP1 or --tp-batch-invariant engine"
             )
 
     def resolve_disaggregation(self):
@@ -2472,7 +2467,8 @@ class ServerArgs:
             choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
             help='Data type for kv cache storage. "auto" and "bfloat16" store BF16 '
             'rows (fp16 activations convert on write). "fp8" is an alias for '
-            '"fp8_e4m3" (unit scale). "mxfp8" stores '
+            '"fp8_e4m3" (unit scale, or the checkpoint\'s per-tensor KV-cache '
+            'scales where the model loads them). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
             "requires --block-size 128 with an MHA attention backend.",
         )
@@ -2566,7 +2562,8 @@ class ServerArgs:
             action="store_true",
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
-            help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+            help="Allow the scheduler to issue prefill and decode requests in the "
+            "same iteration. Not supported with aggregated DCP.",
         )
         parser.add_argument(
             "--prefix-granularity",
@@ -2823,14 +2820,19 @@ class ServerArgs:
         parser.add_argument(
             "--enable-metrics",
             action="store_true",
-            help="Enable log metrics.",
+            help="Enable the selected metrics reporters.",
         )
         parser.add_argument(
             "--metrics-reporters",
             action="append",
-            choices=["prometheus"],
-            default=["prometheus"],
-            help="Select metrics reporter(can be specified multiple times)",
+            default=None,
+            help="Select prometheus or a registered metrics reporter (repeat for multiple; defaults to prometheus).",
+        )
+        parser.add_argument(
+            "--metrics-reporter-config",
+            type=str,
+            default=ServerArgs.metrics_reporter_config,
+            help="JSON file mapping external metrics reporter names to their configurations.",
         )
         parser.add_argument(
             "--metrics-port",
@@ -3664,9 +3666,9 @@ class ServerArgs:
             help="KV parallelism (KVP): shard full-history KV pages (MLA/DSA "
             "latent, DeepSeek V4 compressed KV) cyclically over a consecutive "
             "subgroup of attention TP, each rank storing one shard of every "
-            "request's pages. Must divide --attn-tp-size. PD roles only: the "
-            "decode role reads the shards with --decode-context-parallel-size "
-            "(required there, equal to this), the prefill role writes them and "
+            "request's pages. Must divide --attn-tp-size. Aggregated and PD "
+            "decode engines require equal --decode-context-parallel-size; "
+            "the PD prefill role writes the shards and "
             "may split its query rows over them with "
             "--query-context-parallel-size. Works with the Host KVStore and the "
             "retraction snapshot pool; not with L3 storage "
@@ -3676,12 +3678,11 @@ class ServerArgs:
             "--decode-context-parallel-size",
             type=int,
             default=ServerArgs.decode_context_parallel_size,
-            help="Decode context parallelism (DCP) on the PD decode role: every "
+            help="Decode context parallelism (DCP) in aggregated or PD decode engines: every "
             "rank attends the KV pages it owns under --kv-parallel-size and the "
             "partials are merged across the KVP group by their log-sum-exp. "
-            "Requires --disaggregation-mode decode and must equal "
-            "--kv-parallel-size, which requires it in turn on that role (a "
-            "sharded cache has no other decode).",
+            "Requires --disaggregation-mode null or decode and must equal "
+            "--kv-parallel-size. Aggregated DCP does not support --enable-mixed-batch.",
         )
         parser.add_argument(
             "--attn-head-tp-size",
@@ -3776,25 +3777,23 @@ class ServerArgs:
             "--force-deterministic-rsag",
             action="store_true",
             help="NCCL and the rank-ordered fold only: no symmetric-memory "
-            "path -- neither the Triton multicast all-gather/reduce-scatter "
-            "and in-switch all-reduce, nor the trtllm and Triton all-reduce "
-            "tiers, nor the distributed argmax. With --batch-invariant-collectives every "
-            "reduction takes the fold; without it, NCCL. Not folded in by "
-            "--numerics rl-bitwise, which keeps the multicast paths and "
-            "verifies the in-switch reduction at startup.",
+            "path -- neither the Triton multicast all-gather/reduce-scatter, "
+            "nor the trtllm and Triton all-reduce tiers, nor the distributed "
+            "argmax. With --batch-invariant-collectives every reduction takes "
+            "the fold; without it, NCCL. Not folded in by --numerics "
+            "rl-bitwise, whose gathers keep the multicast kernels.",
         )
         parser.add_argument(
             "--batch-invariant-collectives",
             action="store_true",
             help="One association order per reduction, independent of the "
-            "batch. A 2-D bf16 all-reduce on a multicast-reachable group runs "
-            "as the NVLS in-switch reduction issued by one fixed rank, "
-            "verified bitwise at startup; every other reduction (other "
-            "payloads, unreachable groups, the reduce-scatters) runs as NCCL "
-            "data movement plus a fixed-rank-order fp32 fold, which for an "
-            "all-reduce costs world_size times the traffic. NCCL sums are "
-            "run-stable but chunk by message size, so they are not "
-            "batch-size-invariant. Folded in by --numerics rl-bitwise.",
+            "batch: every reduction runs as NCCL data movement plus a "
+            "fixed-rank-order fp32 fold, which for an all-reduce costs "
+            "world_size times the traffic. NCCL sums are run-stable but chunk "
+            "by message size, and the NVLS in-switch reduction's order moves "
+            "with a row's offset in the buffer, so neither is "
+            "batch-invariant. Gathers keep the multicast kernels. Folded in "
+            "by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--numerics",
@@ -4158,6 +4157,11 @@ class PortArgs:
 
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: str | None
+
+    # Plain producer settings; live output resources remain in their owner process.
+    metrics_producer_configs: dict[str, dict[str, object]] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
 
     @staticmethod
     def init_new(server_args: ServerArgs, dp_rank: int | None = None) -> "PortArgs":

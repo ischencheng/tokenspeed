@@ -39,7 +39,7 @@ from tokenspeed_kernel.ops.attention.mla import (
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
-from tokenspeed_kernel.ops.gemm import bmm
+from tokenspeed_kernel.ops.gemm import bmm, mm
 from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
@@ -355,6 +355,8 @@ class MoEGate(nn.Module):
                 self.weight,
                 out_dtype=torch.float32,
             )
+        elif _platform.is_amd:
+            logits = mm(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
         return logits
@@ -468,7 +470,7 @@ class DeepseekV3MoE(nn.Module):
                     router_logits=router_logits,
                 )
 
-            deferred_finalize = self.experts.supports_deferred_finalize
+            deferred_finalize = self.experts.supports_deferred_cuda_finalize
             routed_expert_output = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
@@ -490,6 +492,7 @@ class DeepseekV3MoE(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
+                hidden_dim=hidden_states.shape[-1],
             )
         else:
             final_hidden_states = (

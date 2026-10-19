@@ -21,7 +21,11 @@ from typing import Literal
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import SelectedKernel, select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    dense_format_signature,
+    dense_tensor_format,
+    format_signature,
+)
 
 __all__ = [
     "quantize_fp8",
@@ -32,7 +36,103 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
+    "rmsnorm_mxfp4_quant",
+    "rmsnorm_nvfp4_quant",
+    "rmsnorm_quantize_fp8_group32",
+    "silu_and_mul_quantize_fp8_group32",
 ]
+
+
+def rmsnorm_mxfp4_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    weight_offset: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse affine RMSNorm with CDNA4-native dynamic MXFP4 quantization.
+
+    Args:
+        x: BF16 rows shaped ``[tokens, width]``.
+        weight: Learned BF16 RMSNorm weight shaped ``[width]``.
+        eps: Epsilon added to the row variance.
+        weight_offset: Center added to the checkpoint weight.
+
+    Returns:
+        Packed E2M1 rows and CDNA4-swizzled E8M0 scales.
+    """
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_cdna4:
+        raise RuntimeError("fused RMSNorm MXFP4 quantization requires CDNA4")
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
+        rmsnorm_mxfp4_quantize,
+    )
+
+    return rmsnorm_mxfp4_quantize(x, weight, eps, weight_offset)
+
+
+def rmsnorm_quantize_fp8_group32(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    override: str | None,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize BF16 [M,K] rows and quantize them with exact group-32 scales.
+
+    Quantization preserves the 1e-4 amax floor and the BF16 normalization
+    boundary. Multiple GEMMs can share the codes and scales.
+
+    Args:
+        x: BF16 rows ``[M, K]`` with unit inner stride; K divisible by 32.
+        weight: Contiguous BF16 RMSNorm weight ``[K]`` on x's device.
+        eps: Positive epsilon added to the row mean square.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        BF16 normalized rows ``[M, K]``, E4M3 codes ``[M, K]`` and canonical
+        uint8 UE8M0 scales ``[M, K/32]``.
+    """
+    kernel = select_kernel(
+        "quantization",
+        "rmsnorm_fp8_group32_ue8m0",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        override=override,
+        solution=solution,
+    )
+    return kernel(x, weight, eps)
+
+
+def silu_and_mul_quantize_fp8_group32(
+    x: torch.Tensor, limit: float | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SwiGLU of BF16 gate/up rows, quantized with exact group-32 UE8M0 scales.
+
+    The activation is ``silu(min(gate, limit)) * clamp(up, -limit, limit)``
+    rounded to BF16 as ``silu_and_mul`` does, then quantized as
+    ``quantize_fp8(granularity="token_group", group_size=32,
+    scale_encoding="ue8m0")`` does, keeping the 1e-4 amax floor.
+
+    Args:
+        x: BF16 ``[M, 2 * I]`` rows (gate columns, then up columns) with a
+            contiguous last axis; I divisible by 32.
+        limit: Positive SwiGLU clamp, or None for no clamp.
+
+    Returns:
+        E4M3 codes ``[M, I]`` and uint8 UE8M0 scales ``[M, I / 32]``.
+    """
+    kernel = select_kernel(
+        "quantization",
+        "silu_and_mul_fp8_group32_ue8m0",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        override=None,
+        solution=None,
+    )
+    return kernel(x, limit)
 
 
 def _quantize_fp8_roundtrip(
@@ -687,6 +787,59 @@ def quantize_fp8_with_gate(
         ),
     )
     return kernel(x, gate, norm_weight=norm_weight, eps=eps, enable_pdl=enable_pdl)
+
+
+def rmsnorm_nvfp4_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    weight_offset: float,
+    global_scale: torch.Tensor,
+    mailbox_sentinel: int | None,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RMSNorm a BF16 row and quantize it to NVFP4 in one launch.
+
+    Reproduces ``affine_rmsnorm`` (with its BF16 output rounding) followed by
+    ``fp4_quantize(..., is_sf_swizzled_layout=False)`` bit for bit, so the
+    result feeds the TRT-LLM FP4 MoE kernels directly.
+
+    With ``mailbox_sentinel`` the rows are this rank's Lamport mailbox, still
+    being filled by the sharded projection's multicast stores: each program
+    polls its row until no BF16 element still holds the sentinel's half, then
+    re-arms the row, so no gather launch stands between the projection and
+    the experts.
+
+    Args:
+        x: BF16 rows ``[rows, width]`` with ``width`` a multiple of 16; with
+            a sentinel, the contiguous mailbox rows and a power-of-two width.
+        weight: Learned affine norm weight ``[width]``.
+        eps: Epsilon added to the variance.
+        weight_offset: Center added to the checkpoint weight.
+        global_scale: FP32 ``[1]`` NVFP4 global scale, the inverse of the
+            activation's input scale.
+        mailbox_sentinel: The 32-bit word ``x`` is armed with, whose 16-bit
+            halves agree, or None for an ordinary tensor.
+        enable_pdl: Enable NVIDIA programmatic dependent launch.
+
+    Returns:
+        ``(packed, scales)``: E2M1 pairs as ``uint8 [rows, width // 2]`` and
+        E4M3 block scales as ``uint8 [rows, width // 16]`` in linear layout.
+    """
+    kernel = select_kernel(
+        "quantization",
+        "rmsnorm_nvfp4",
+        dense_format_signature(("x",), (x.dtype,)),
+    )
+    return kernel(
+        x,
+        weight,
+        eps,
+        weight_offset,
+        global_scale,
+        mailbox_sentinel,
+        enable_pdl,
+    )
 
 
 # Backend registration (side-effect imports).

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
+from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.tuning import (
     autotune,
@@ -399,6 +400,9 @@ class ModelExecutorConfig:
     # every row.
     query_shard_size: int
     query_shard_rank: int
+    # Sleep/wake (--enable-memory-saver): decode CUDA graphs are captured into
+    # the memory saver's ``cuda_graph`` region so a release can free them.
+    enable_memory_saver: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -502,6 +506,7 @@ class ModelExecutorConfig:
             decode_only_attention=server_args.mapping.attn.head_tp_serves_decode_only,
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
+            enable_memory_saver=server_args.enable_memory_saver,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -586,7 +591,11 @@ class ModelExecutor:
             raise NotImplementedError(
                 "Engram input history requires PP=1 and in-flight depth <= 1"
             )
-        self.input_buffers.init_ngram_buffers(ngram_context)
+        self.input_buffers.init_ngram_buffers(
+            ngram_context,
+            model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
+            config.vocab_size,
+        )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
@@ -1803,8 +1812,25 @@ class ModelExecutor:
                     .to(torch.int32)
                 )
 
+        bs = req_pool_indices.shape[0]
         ib = self.input_buffers
         tail = self.runtime_states.ngram_accepted_tokens
+        if tail is not None:
+            commit_ngram_inputs(
+                req_pool_indices,
+                input_lengths,
+                accept_lengths,
+                ib.input_ids_buf,
+                ib.ngram_previous_tokens_buf,
+                ib.ngram_token_mask_buf,
+                ib.ngram_prefix_buf[:bs],
+                tail,
+                self.runtime_states.ngram_needs_seed,
+                self.runtime_states.valid_cache_lengths,
+                num_extends,
+                ib.state_write_padding_pool_index,
+            )
+            return
         advance_accepted_frontier(
             req_pool_indices,
             input_lengths,
@@ -1812,10 +1838,6 @@ class ModelExecutor:
             self.runtime_states.valid_cache_lengths,
             num_extends,
             ib.state_write_padding_pool_index,
-            ngram_tail=tail,
-            ngram_previous_tokens=ib.ngram_previous_tokens_buf,
-            ngram_token_mask=ib.ngram_token_mask_buf,
-            input_ids=ib.input_ids_buf if tail is not None else None,
         )
 
     def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
@@ -1866,8 +1888,8 @@ class ModelExecutor:
                     batch_size=padded_bs,
                     total_tokens=padded_bs * self.config.output_length,
                 )
-                # Captured hostfunc pops one entry per replay; push a dummy
-                # for this idle replay, same as run_once.
+                # Captured hostfunc pops one gate decision per replay; add a
+                # dummy for this idle replay, same as run_once.
                 if self.capturable_grammar is not None:
                     self.capturable_grammar.add_batch(
                         grammars=[None] * padded_bs,

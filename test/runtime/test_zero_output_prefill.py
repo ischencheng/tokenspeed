@@ -382,7 +382,11 @@ def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
     # (A replicated head: LM-head TP peers under attention DP would still
     # join the row exchange with no rows.)
     output = forward(
-        SimpleNamespace(config=SimpleNamespace(vocab_size=32), dp_lm_head_tp=False),
+        SimpleNamespace(
+            config=SimpleNamespace(vocab_size=32),
+            dp_lm_head_tp=False,
+            _query_shard=lambda metadata: None,
+        ),
         torch.arange(4),
         torch.empty(0, 8),
         None,
@@ -408,6 +412,7 @@ def test_selected_logits_do_not_gather_original_input_indices():
     )
     hidden = torch.arange(16).view(2, 8).float()
     processor = SimpleNamespace(
+        _query_shard=lambda metadata: None,
         _resolve_logits_layout_plan=lambda *args: None,
         _get_logits=lambda h, *args, **kwargs: h,
         do_argmax=False,
@@ -443,6 +448,7 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
         positions,
         hidden,
         SimpleNamespace(attn_backend=None, forward_mode=object()),
+        reduce_output=True,
     )
     assert output.shape == (0, 8)
     torch.testing.assert_close(writes[0], hidden)
@@ -453,7 +459,11 @@ def test_zero_decoder_skips_layers_and_normalization():
     forward = load_symbol(
         RUNTIME + "models/deepseek_v41.py", "decoder_forward", owner="DeepseekV41Model"
     )
-    model = SimpleNamespace(ced_decoder_start=20, dspark_capture_layers=(19, 20, 39))
+    model = SimpleNamespace(
+        ced_decoder_start=20,
+        dspark_capture_layers=(19, 20, 39),
+        mapping=SimpleNamespace(attn=SimpleNamespace(has_dp=False)),
+    )
     state = SimpleNamespace(
         rows=0,
         hidden=torch.empty(0, 4, 8),
@@ -503,7 +513,8 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
     assert tokens.tolist() == [0, 1]
 
 
-def test_idle_graph_grammar_enqueues_an_identity_completion():
+@pytest.mark.parametrize("pending", [False, True])
+def test_idle_graph_grammar_enqueues_an_identity_completion(pending):
     import queue
     from contextlib import nullcontext
 
@@ -511,9 +522,16 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
         RUNTIME + "grammar/capturable_grammar.py",
         "add_batch",
         owner="CapturableGrammarExecutor",
-        GrammarStepCompletion=SimpleNamespace,
+        GrammarStepCompletion=lambda **kwargs: SimpleNamespace(
+            event=threading.Event(), **kwargs
+        ),
     )
-    grammar = SimpleNamespace(queue=queue.Queue())
+    decisions = []
+    grammar = SimpleNamespace(
+        queue=queue.Queue(),
+        gate=SimpleNamespace(push=decisions.append),
+        pending=pending,
+    )
     grammar.add_batch = lambda **kwargs: add(grammar, **kwargs)
     idle = load_symbol(
         RUNTIME + "execution/model_executor.py",
@@ -561,6 +579,9 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
             valid_cache_lengths=torch.zeros(1), vocab_size=32
         ),
         device="cpu",
+        default_stream=None,
+        execution_stream=SimpleNamespace(wait_stream=lambda stream: None),
+        device_module=SimpleNamespace(stream=lambda stream: nullcontext()),
         forward_step=step,
         config=SimpleNamespace(output_length=1),
         capturable_grammar=grammar,
@@ -572,8 +593,13 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
         ),
     )
     assert step.called
-    completion = grammar.queue.get_nowait()["completion"]
-    assert completion.output_layout == ForwardOutputLayout(0, 0, 1, 1)
+    # One gate decision per replay; it runs only to advance a pending batch.
+    assert decisions == [pending]
+    assert not grammar.pending
+    if pending:
+        completion = grammar.queue.get_nowait()["completion"]
+        assert completion.output_layout == ForwardOutputLayout(0, 0, 1, 1)
+        assert completion.event.is_set()
     assert grammar.queue.empty()
 
 
@@ -737,6 +763,7 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         _swa_plans={},
         _prepared_selections={},
         _decode_schedules={},
+        _index_geometry={},
         sparse_topk={},
         _check_tables=lambda *args: None,
         _upload_int64=lambda values: torch.tensor(values, dtype=torch.int64),

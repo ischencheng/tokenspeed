@@ -564,8 +564,9 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
 
 @pytest.mark.parametrize("speculative,width", [(False, 1), (True, 1), (True, 3)])
 @pytest.mark.parametrize("ple_enabled", (False, True))
+@pytest.mark.parametrize("role", ("null", "prefill", "decode"))
 def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
-    speculative: bool, width: int, ple_enabled: bool
+    speculative: bool, width: int, ple_enabled: bool, role: str
 ) -> None:
     text_config = SimpleNamespace(
         ple_layer_ids=(0, 1) if ple_enabled else (),
@@ -591,6 +592,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         speculative_num_draft_tokens=width,
         **_model_wide_kwargs(),
     )
+    attn_config = replace(attn_config, pd_disaggregation_enabled=role != "null")
     draft_config = (
         replace(
             attn_config,
@@ -606,6 +608,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         speculative_num_draft_tokens=width,
         speculative_eagle_topk=1,
         enable_replay_ssm=False,
+        disaggregation_mode=role,
     )
     setup = prepare_cache_setup(
         family="qwen4_exp",
@@ -623,7 +626,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
-    if not speculative:
+    if not speculative or role == "prefill":
         assert setup.fixed_workspace_bytes == 0
         return
 
@@ -1245,6 +1248,27 @@ def test_qwen_state_blocks_carry_no_attention_planes() -> None:
     assert _page_padding(plan) == {
         FULL_ATTENTION: 4 * conv_bytes,
         "linear_attention_0": 0,
+    }
+
+
+def test_qwen_conv_windows_fill_a_free_state_segment() -> None:
+    """When the SSM states leave a segment free, the conv windows pack into it and KV pages pad nothing."""
+    plan = _qwen_gdn_setup(2).spec.memory_plan
+    payload = {
+        suffix: {
+            field.payload_bytes
+            for field in plan.fields
+            if field.field_id.endswith(suffix)
+        }.pop()
+        for suffix in (".ssm", ".conv")
+    }
+
+    # Six GDN layers over four segments: two groups of three states, one segment left for their conv windows.
+    assert plan.lcm_block_bytes == 4 * payload[".ssm"]
+    assert _page_padding(plan) == {
+        FULL_ATTENTION: 0,
+        "linear_attention_0": payload[".ssm"] - 3 * payload[".conv"],
+        "linear_attention_1": payload[".ssm"] - 3 * payload[".conv"],
     }
 
 

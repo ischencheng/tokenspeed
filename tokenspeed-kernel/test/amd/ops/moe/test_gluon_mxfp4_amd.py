@@ -1,10 +1,38 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
-from kimi3_reference import dequantize_mxfp4
+from tokenspeed_kernel.numerics.torch.activation import (
+    deinterleave_gate_up,
+    swiglu,
+)
+from tokenspeed_kernel.numerics.torch.moe import (
+    DequantizedExperts,
+    torch_moe_experts,
+)
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from utils import (
     assert_no_triton_compile,
@@ -23,10 +51,14 @@ if not is_amd():
 
 
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
+    _quantize_mxfp4_activation,
     gluon_mxfp_dynamic_mxfp4_fused_moe,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     gluon_mxfp_fused_moe as _gfx950_static_moe,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
+    gluon_mxfp_precomputed_mxfp4_fused_moe,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx950_moe_weights,
@@ -68,27 +100,25 @@ def _fp8_mxfp4_swiglu_moe_reference(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    x_fp8 = hidden_states.to(torch.float8_e4m3fn).float()
-    w13 = dequantize_mxfp4(w13_weight, w13_scale)
-    w2 = dequantize_mxfp4(w2_weight, w2_scale)
-    expected = torch.zeros_like(hidden_states, dtype=torch.float32)
+    def to_fp8(values: torch.Tensor) -> torch.Tensor:
+        return values.to(torch.bfloat16).to(torch.float8_e4m3fn)
 
-    for token in range(hidden_states.shape[0]):
-        for slot in range(topk_ids.shape[1]):
-            expert = int(topk_ids[token, slot])
-            gate_up = F.linear(x_fp8[token], w13[expert], w13_bias[expert])
-            gate = gate_up[0::2].clamp(max=7.0)
-            linear = gate_up[1::2].clamp(-7.0, 7.0)
-            intermediate = gate * torch.sigmoid(1.702 * gate) * (linear + 1.0)
-            intermediate_fp8 = (
-                intermediate.to(torch.bfloat16).to(torch.float8_e4m3fn).float()
-            )
-            partial = F.linear(intermediate_fp8, w2[expert], w2_bias[expert]).to(
-                torch.bfloat16
-            )
-            expected[token] += partial.float() * topk_weights[token, slot]
-
-    return expected.to(torch.bfloat16)
+    return torch_moe_experts(
+        hidden_states,
+        dequantize_mxfp4(w13_weight, w13_scale),
+        dequantize_mxfp4(w2_weight, w2_scale),
+        topk_ids,
+        topk_weights,
+        activation=lambda gate_up: swiglu(
+            deinterleave_gate_up(gate_up), alpha=1.702, limit=7.0, beta=1.0
+        ),
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        quantize_input=to_fp8,
+        quantize_intermediate=to_fp8,
+        round_expert_output=torch.Tensor.bfloat16,
+        first_expert=0,
+    ).to(torch.bfloat16)
 
 
 def _make_mxfp4_moe_module(
@@ -142,6 +172,24 @@ def _make_static_fp8_moe_module(
     return module
 
 
+def _make_dynamic_mxfp4_moe_module(raw: dict[str, torch.Tensor]) -> torch.nn.Module:
+    module = torch.nn.Module()
+    module.w13_input_layout = "interleaved"
+    module.quant_config = SimpleNamespace(use_dynamic_mxfp4_activations=True)
+    module.w13_weight = torch.nn.Parameter(
+        raw["w13_weight"].clone(), requires_grad=False
+    )
+    module.w13_weight_scale = torch.nn.Parameter(
+        raw["w13_scale"].clone(), requires_grad=False
+    )
+    module.w2_weight = torch.nn.Parameter(raw["w2_weight"].clone(), requires_grad=False)
+    module.w2_weight_scale = torch.nn.Parameter(
+        raw["w2_scale"].clone(), requires_grad=False
+    )
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
+    return module
+
+
 @pytest.mark.parametrize("num_tokens", [1, 2])
 def test_dynamic_mxfp4_activation_moe(
     monkeypatch: pytest.MonkeyPatch, num_tokens: int
@@ -154,54 +202,13 @@ def test_dynamic_mxfp4_activation_moe(
     hidden_size = 256
     intermediate_size = 256
     top_k = 2
-    raw_w13 = torch.randint(
-        0,
-        256,
-        (num_experts, 2 * intermediate_size, hidden_size // 2),
-        dtype=torch.uint8,
-        device="cuda",
+    raw = make_mxfp4_moe_weights(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
         generator=generator,
     )
-    raw_w2 = torch.randint(
-        0,
-        256,
-        (num_experts, hidden_size, intermediate_size // 2),
-        dtype=torch.uint8,
-        device="cuda",
-        generator=generator,
-    )
-    raw_w13_scale = torch.full(
-        (num_experts, 2 * intermediate_size, hidden_size // 32),
-        120,
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    raw_w2_scale = torch.full(
-        (num_experts, hidden_size, intermediate_size // 32),
-        120,
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    module = torch.nn.Module()
-    module.w13_input_layout = "interleaved"
-    module.quant_config = SimpleNamespace(use_dynamic_mxfp4_activations=True)
-    module.w13_weight = torch.nn.Parameter(
-        raw_w13.clone(),
-        requires_grad=False,
-    )
-    module.w2_weight = torch.nn.Parameter(
-        raw_w2.clone(),
-        requires_grad=False,
-    )
-    module.w13_weight_scale = torch.nn.Parameter(
-        raw_w13_scale.clone(),
-        requires_grad=False,
-    )
-    module.w2_weight_scale = torch.nn.Parameter(
-        raw_w2_scale.clone(),
-        requires_grad=False,
-    )
-    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
+    module = _make_dynamic_mxfp4_moe_module(raw)
 
     hidden_states = torch.randn(
         num_tokens,
@@ -262,8 +269,8 @@ def test_dynamic_mxfp4_activation_moe(
     topk_weights, topk_ids = torch.topk(scores, top_k, dim=-1)
     topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
     hidden = _dequantize_dynamic_mxfp4(hidden_states)
-    w13 = dequantize_mxfp4(raw_w13, raw_w13_scale).to(torch.bfloat16)
-    w2 = dequantize_mxfp4(raw_w2, raw_w2_scale).to(torch.bfloat16)
+    w13 = dequantize_mxfp4(raw["w13_weight"], raw["w13_scale"]).to(torch.bfloat16)
+    w2 = dequantize_mxfp4(raw["w2_weight"], raw["w2_scale"]).to(torch.bfloat16)
     expected = torch.zeros_like(actual, dtype=torch.float32)
     for token in range(num_tokens):
         for slot in range(top_k):
@@ -279,6 +286,140 @@ def test_dynamic_mxfp4_activation_moe(
             ).float()
 
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "global_num_experts", "input_kind"),
+    (
+        (1, 8, "tensor"),
+        (8, 8, "tensor"),
+        (16, 8, "tensor"),
+        (17, 16, "tensor"),
+        (17, 16, "tensor_quantized"),
+        (4, 8, "packed"),
+        (33, 8, "packed"),
+    ),
+)
+def test_dynamic_mxfp4_deferred_ep(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    global_num_experts: int,
+    input_kind: str,
+) -> None:
+    if not is_cdna4():
+        pytest.skip("Dynamic MXFP4 activation is unavailable on this GPU")
+
+    generator = torch.Generator(device="cuda").manual_seed(20260916)
+    num_local_experts = 2
+    expert_start = 6
+    hidden_size = 256
+    intermediate_size = 256
+    top_k = 2
+    raw = make_mxfp4_moe_weights(
+        num_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        generator=generator,
+    )
+    module = _make_dynamic_mxfp4_moe_module(raw)
+
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    local_ids = expert_start + torch.arange(num_tokens, device="cuda") % 2
+    remote_ids = torch.arange(num_tokens, device="cuda") % 2
+    topk_ids = torch.stack((local_ids, remote_ids), dim=1).to(torch.int32)
+    topk_weights = torch.rand(
+        (num_tokens, top_k),
+        dtype=torch.float32,
+        device="cuda",
+        generator=generator,
+    )
+    x_quantized = (
+        _quantize_mxfp4_activation(hidden_states) if input_kind != "tensor" else None
+    )
+    if x_quantized is not None:
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe
+
+        monkeypatch.setattr(
+            moe,
+            "_quantize_mxfp4_activation",
+            lambda _hidden_states: pytest.fail(
+                "package prefill requantized a prequantized activation"
+            ),
+        )
+    if input_kind == "packed":
+        from tokenspeed_kernel.ops.moe import moe_apply
+
+        module.num_local_experts = num_local_experts
+        module.num_experts = global_num_experts
+        module.ep_rank = expert_start // num_local_experts
+        plan = {
+            "apply_kernel_name": "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply"
+        }
+        route_output, _, expanded_idx = moe_apply(
+            plan,
+            x_quantized,
+            module,
+            None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            do_finalize=False,
+        )
+    else:
+        route_output, _, expanded_idx = gluon_mxfp_precomputed_mxfp4_fused_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            expert_start=expert_start,
+            global_num_experts=global_num_experts,
+            do_finalize=False,
+            x_quantized=x_quantized,
+            w13_bias=None,
+            w2_bias=None,
+            out_dtype=torch.bfloat16,
+            swiglu_alpha=1.0,
+            swiglu_limit=0.0,
+            swiglu_beta=0.0,
+            out=None,
+        )
+    torch.cuda.synchronize()
+
+    route_output = route_output.view(num_tokens, top_k, hidden_size)
+    expected_map = torch.stack(
+        (
+            torch.arange(num_tokens, device="cuda", dtype=torch.int32) * top_k,
+            torch.full((num_tokens,), -1, device="cuda", dtype=torch.int32),
+        ),
+        dim=1,
+    ).flatten()
+    torch.testing.assert_close(expanded_idx, expected_map, atol=0, rtol=0)
+
+    hidden = _dequantize_dynamic_mxfp4(hidden_states)
+    w13 = dequantize_mxfp4(raw["w13_weight"], raw["w13_scale"])
+    w2 = dequantize_mxfp4(raw["w2_weight"], raw["w2_scale"])
+    expected = torch.empty_like(route_output[:, 0])
+    for token in range(num_tokens):
+        expert = int(local_ids[token]) - expert_start
+        gate_up = F.linear(hidden[token].float(), w13[expert].float())
+        gate = gate_up[0::2].to(torch.bfloat16)
+        linear = gate_up[1::2].to(torch.bfloat16)
+        intermediate = (gate.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
+        intermediate = (intermediate * linear).to(torch.bfloat16)
+        intermediate = _dequantize_dynamic_mxfp4(intermediate[None])[0]
+        expected[token] = F.linear(intermediate.float(), w2[expert].float()).to(
+            torch.bfloat16
+        )
+    torch.testing.assert_close(
+        route_output[:, 0].float(), expected.float(), atol=2e-2, rtol=2e-2
+    )
 
 
 def test_static_fp8_activation_moe_gfx950_smoke() -> None:
@@ -926,30 +1067,25 @@ def _dynamic_mxfp4_swiglu_moe_reference(
     limit: float,
     beta: float,
 ) -> torch.Tensor:
-    hidden = _dequantize_dynamic_mxfp4(hidden_states).float()
-    expected = torch.zeros_like(hidden_states, dtype=torch.float32)
-    for expert in topk_ids.unique().tolist():
-        token, slot = (topk_ids == expert).nonzero(as_tuple=True)
-        w13 = dequantize_mxfp4(raw["w13_weight"][expert], raw["w13_scale"][expert])
-        w2 = dequantize_mxfp4(raw["w2_weight"][expert], raw["w2_scale"][expert])
-        gate_up = F.linear(
-            hidden[token], w13, None if w13_bias is None else w13_bias[expert]
-        )
-        gate, linear = gate_up[:, 0::2], gate_up[:, 1::2]
-        if limit > 0:
-            gate = gate.clamp(max=limit)
-            linear = linear.clamp(-limit, limit)
-        intermediate = gate * torch.sigmoid(alpha * gate) * (linear + beta)
-        intermediate = _dequantize_dynamic_mxfp4(intermediate.to(torch.bfloat16))
-        partial = F.linear(
-            intermediate.float(), w2, None if w2_bias is None else w2_bias[expert]
-        )
-        expected.index_add_(
-            0,
-            token,
-            partial.to(torch.bfloat16).float() * topk_weights[token, slot, None],
-        )
-    return expected.to(torch.bfloat16)
+    return torch_moe_experts(
+        hidden_states,
+        DequantizedExperts(dequantize_mxfp4, raw["w13_weight"], raw["w13_scale"]),
+        DequantizedExperts(dequantize_mxfp4, raw["w2_weight"], raw["w2_scale"]),
+        topk_ids,
+        topk_weights,
+        activation=lambda gate_up: swiglu(
+            deinterleave_gate_up(gate_up),
+            alpha=alpha,
+            limit=limit if limit > 0 else None,
+            beta=beta,
+        ),
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        quantize_input=_dequantize_dynamic_mxfp4,
+        quantize_intermediate=lambda t: _dequantize_dynamic_mxfp4(t.bfloat16()),
+        round_expert_output=torch.Tensor.bfloat16,
+        first_expert=0,
+    ).to(torch.bfloat16)
 
 
 @pytest.mark.parametrize("decode,num_tokens", [(False, 4), (True, 1)])
@@ -1098,6 +1234,64 @@ def test_dynamic_mxfp4_activation_moe_gfx1250_dsv41_shapes(
     assert actual.shape == hidden_states.shape
     assert torch.count_nonzero(expected).item() > 0
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_gfx1250_prefill_xcd_swizzle_covers_every_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefill tiles' XCD swizzle must visit every tile exactly once.
+
+    The swizzle remaps program IDs over the routed tile count read on the
+    device, which here is not a multiple of the swizzle width. Remapping only
+    reorders tiles, so the output must match the unswizzled launch exactly.
+    """
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE kernel")
+
+    generator = torch.Generator(device="cuda").manual_seed(20261012)
+    # Seven experts with ~57 rows each give 14 tiles per GEMM.
+    hidden_size, intermediate_size, num_experts, top_k, num_tokens = (
+        512,
+        256,
+        7,
+        2,
+        200,
+    )
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    module = _make_static_fp8_moe_module(
+        raw, preprocess_gluon_mxfp4_gfx1250_moe_weights
+    )
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+
+    def run() -> torch.Tensor:
+        return _gfx1250_static_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            activation="situ",
+            activation_dtype="fp8",
+        )
+
+    swizzled = run()
+    for name in ("_PREFILL_GATE_UP_TILES", "_PREFILL_DOWN_TILES"):
+        tiles = getattr(gfx1250_fused, name)
+        assert tiles["xcd_swizzle"] > 1
+        monkeypatch.setattr(gfx1250_fused, name, {**tiles, "xcd_swizzle": 1})
+    unswizzled = run()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(unswizzled).item() > 0
+    torch.testing.assert_close(swizzled, unswizzled, rtol=0.0, atol=0.0)
 
 
 def _gfx1250_first_expert_matmul(
