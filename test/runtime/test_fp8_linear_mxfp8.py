@@ -11,7 +11,7 @@ from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.dense.fp8 import (
     Fp8LinearMethod,
-    mxfp8_vendor_gemm_available,
+    mxfp8_linears_load_as_bf16,
 )
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 
@@ -42,7 +42,7 @@ def _method() -> Fp8LinearMethod:
 
 
 _KEEPS_FP8 = pytest.mark.skipif(
-    torch.cuda.is_available() and not mxfp8_vendor_gemm_available(),
+    torch.cuda.is_available() and mxfp8_linears_load_as_bf16(),
     reason="without a vendor MXFP8 GEMM the linear is dequantized to BF16",
 )
 
@@ -85,6 +85,21 @@ def test_small_layers_keep_triton_fallback() -> None:
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.parametrize("vendor,arch", [("nvidia", (9, 0)), ("amd", (12, 1))])
+def test_only_nvidia_without_a_vendor_gemm_loads_mxfp8_linears_as_bf16(vendor, arch):
+    """gfx1201 has only portable kernels too, but DeepSeek-V4.1's projection
+    method prepares MXFP8 scales there after the base processing; only NVIDIA
+    switches to BF16."""
+    original = current_platform()
+    Platform.override(
+        dataclasses.replace(original, vendor=vendor, arch_version=ArchVersion(*arch))
+    )
+    try:
+        assert mxfp8_linears_load_as_bf16() is (vendor == "nvidia")
+    finally:
+        Platform.override(original)
+
+
 def test_sm90_dequantizes_mxfp8_linears_to_exact_bf16() -> None:
     """SM90 has only the portable Triton block-FP8 GEMM for 1x32 scales, so the
     weights become exact BF16 at load and the layer runs the BF16 GEMM. The
@@ -94,7 +109,7 @@ def test_sm90_dequantizes_mxfp8_linears_to_exact_bf16() -> None:
         dataclasses.replace(original, vendor="nvidia", arch_version=ArchVersion(9, 0))
     )
     try:
-        assert not mxfp8_vendor_gemm_available()
+        assert mxfp8_linears_load_as_bf16()
         n, k = 256, 512
         layer = _make_layer(n, k)
         layer.orig_dtype = torch.bfloat16

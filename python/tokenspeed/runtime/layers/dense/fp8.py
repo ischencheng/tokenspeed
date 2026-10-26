@@ -54,16 +54,22 @@ def _warn_once(message: str) -> None:
     logger.warning(message)
 
 
-def mxfp8_vendor_gemm_available(platform=None) -> bool:
-    """Whether a vendor (not Triton, not torch) GEMM for MXFP8 operands with
-    1x32 UE8M0 scales is registered for ``platform`` (default: this
-    process's). Without one (SM90 today) the portable Triton block-FP8 GEMM
-    is the only kernel, and it runs far below the BF16 GEMM on the same
-    weights, so ``Fp8LinearMethod`` dequantizes such layers at load."""
+def mxfp8_linears_load_as_bf16(platform=None) -> bool:
+    """Whether MXFP8 linears with 1x32 UE8M0 scales run as BF16 on ``platform``
+    (default: this process's): NVIDIA with no vendor (not Triton, not torch)
+    GEMM for them, i.e. SM90 today. There only the portable Triton block-FP8
+    GEMM takes these scales; with no tensor-core kernel for 32-wide blocks it
+    trails the BF16 GEMM on the same weights at every shape (DeepSeek-V4.1's
+    projections load as BF16 on Hopper for the same reason). Other vendors
+    keep their own kernels."""
     import tokenspeed_kernel.ops.gemm  # noqa: F401  (registers the GEMMs)
     from tokenspeed_kernel.platform import current_platform
     from tokenspeed_kernel.registry import KernelRegistry
     from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
+
+    platform = platform or current_platform()
+    if not platform.is_nvidia:
+        return False
 
     scale = ScaleFormat(
         storage_dtype=torch.uint8, granularity="block", block_shape=(1, 32)
@@ -72,10 +78,10 @@ def mxfp8_vendor_gemm_available(platform=None) -> bool:
     kernels = KernelRegistry.get().get_for_operator(
         "gemm",
         "mm",
-        platform=platform or current_platform(),
+        platform=platform,
         format_signature=format_signature(a=operand, b=operand),
     )
-    return any(spec.solution not in ("triton", "torch") for spec in kernels)
+    return not any(spec.solution not in ("triton", "torch") for spec in kernels)
 
 
 def dequantize_mxfp8(
@@ -99,7 +105,8 @@ class Fp8LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
         # MXFP8 [1, 32] weights dequantized at load where no vendor GEMM takes
-        # them (mxfp8_vendor_gemm_available); the layer then runs unquantized.
+        # them on NVIDIA (mxfp8_linears_load_as_bf16); the layer then runs
+        # unquantized.
         self.dequantized = False
         self._unquantized = None
 
@@ -241,7 +248,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 grouped_output_projection_plan is None
                 and tuple(self.quant_config.weight_block_size) == (1, 32)
                 and layer.weight_scale_inv.dtype == torch.uint8
-                and not mxfp8_vendor_gemm_available()
+                and mxfp8_linears_load_as_bf16()
             ):
                 self._dequantize_at_load(layer)
                 return
@@ -319,7 +326,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         _warn_once(
             "MXFP8 linears are dequantized to BF16 at load: no vendor GEMM for "
-            "1x32 UE8M0 scales is registered on this platform"
+            "1x32 UE8M0 scales is registered on this NVIDIA platform"
         )
         layer.weight = Parameter(
             dequantize_mxfp8(
