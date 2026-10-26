@@ -186,6 +186,7 @@ def _msa_server_args(**overrides) -> SimpleNamespace:
         spec_context_pad=0,
         attention_backend="trtllm",
         drafter_attention_backend=None,
+        skip_softmax_threshold=0.0,
         prefix_granularity=128,
         max_num_seqs=16,
         data_parallel_size=1,
