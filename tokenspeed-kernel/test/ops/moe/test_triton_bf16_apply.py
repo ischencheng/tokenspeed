@@ -265,6 +265,7 @@ def test_triton_bf16_moe_token_count():
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     plan["precision_policy"] = "bf16_route_accum_fp32"
     plan["output_scale"] = 1.0
