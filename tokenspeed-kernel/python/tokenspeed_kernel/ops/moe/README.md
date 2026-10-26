@@ -280,6 +280,19 @@ expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
 
+## Marlin W4A16 experts (`marlin.py`)
+
+The vendored Marlin MoE dequantizes 4-bit E2M1 weights inside the grouped GEMM,
+so activations stay BF16 and SM90 needs no FP4 tensor cores. It serves MXFP4
+(E8M0 group-32 scales; Kimi-K3 on Hopper) and NVFP4 (E4M3 group-16 scales and
+one FP32 global scale per expert). For NVFP4 the block scales are re-encoded
+without a sign bit and the global scale carries the BF16 exponent bias; the
+kernel multiplies by the BF16-rounded global scale after GEMM1 and folds it into
+the BF16 route weight in GEMM2. GEMM1 has one global scale per expert, so the
+gate and up halves of `w13` must share it. The intermediate size per partition
+must be a multiple of 64. NVFP4 runs standard SwiGLU, or SwiGLU-OAI through
+`swiglu_oai`; MXFP4 runs SiLU, SwiGLU and SiTU.
+
 ## FP8 per-channel experts
 
 Per-channel FP8 experts store weights in FP8 E4M3 with FP32 scales per output

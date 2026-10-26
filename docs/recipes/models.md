@@ -253,8 +253,12 @@ Notes:
 
 For checkpoints that declare `quant_method: mxfp8` with
 `moe_quant_algo: NVFP4`, TokenSpeed automatically selects `mxfp8_nvfp4`:
-projections use MXFP8 and routed experts use NVFP4. This quantization requires
-Blackwell.
+projections use MXFP8 and routed experts use NVFP4. On SM90 (H100/H200) the
+routed experts run on the Marlin W4A16 MoE with BF16 activations, and the MXFP8
+projections are dequantized to BF16 at load, which doubles their memory (about
+11 GB of projection weights for the whole model). The launch below is the
+Blackwell one: `--attention-backend trtllm` and `--moe-backend
+flashinfer_trtllm` are Blackwell-only, so leave both unset on SM90.
 
 Download the target and bundled DSpark draft together. The draft is in the
 `dspark/` subdirectory and declares `DSparkMiniMaxDraftModel`. This example uses
