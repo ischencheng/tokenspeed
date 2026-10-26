@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
+from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.fp8 import (
+    Fp8LinearMethod,
+    mxfp8_vendor_gemm_available,
+)
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 
 pytestmark = pytest.mark.skipif(
@@ -35,6 +41,13 @@ def _method() -> Fp8LinearMethod:
     )
 
 
+_KEEPS_FP8 = pytest.mark.skipif(
+    torch.cuda.is_available() and not mxfp8_vendor_gemm_available(),
+    reason="without a vendor MXFP8 GEMM the linear is dequantized to BF16",
+)
+
+
+@_KEEPS_FP8
 def test_process_weights_preserves_canonical_scales() -> None:
     n, k = 256, 512
     layer = _make_layer(n, k)
@@ -58,6 +71,7 @@ def test_process_weights_preserves_canonical_scales() -> None:
     assert rel < 5e-2, f"rel_l2={rel}"
 
 
+@_KEEPS_FP8
 def test_small_layers_keep_triton_fallback() -> None:
     # N < 128 is below the flashinfer problem-size floor; the layer must
     # keep row-major scales so the Triton kernel stays selectable.
@@ -69,3 +83,42 @@ def test_small_layers_keep_triton_fallback() -> None:
     x = torch.randn(8, 512, device="cuda", dtype=torch.bfloat16)
     out = _method().apply(layer, x)
     assert torch.isfinite(out).all()
+
+
+def test_sm90_dequantizes_mxfp8_linears_to_exact_bf16() -> None:
+    """SM90 has only the portable Triton block-FP8 GEMM for 1x32 scales, so the
+    weights become exact BF16 at load and the layer runs the BF16 GEMM. The
+    FP8-keeping path where a vendor GEMM exists is the tests above."""
+    original = current_platform()
+    Platform.override(
+        dataclasses.replace(original, vendor="nvidia", arch_version=ArchVersion(9, 0))
+    )
+    try:
+        assert not mxfp8_vendor_gemm_available()
+        n, k = 256, 512
+        layer = _make_layer(n, k)
+        layer.orig_dtype = torch.bfloat16
+        codes = layer.weight.data.clone()
+        scales = layer.weight_scale_inv.data.clone()
+        method = _method()
+        method.process_weights_after_loading(layer)
+    finally:
+        Platform.override(original)
+
+    assert method.dequantized
+    assert layer.weight_scale_inv is None
+    exact = codes.float() * torch.exp2(scales.float() - 127.0).repeat_interleave(
+        32, dim=1
+    )
+    assert layer.weight.dtype == torch.bfloat16
+    assert torch.equal(layer.weight.float(), exact)
+
+    x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
+    out = method.apply(layer, x).float()
+    ref = x.float() @ exact.t()
+    two_ulps = 2.0**-7
+    torch.testing.assert_close(
+        out, ref, atol=two_ulps * ref.abs().max().item(), rtol=two_ulps
+    )
+    with pytest.raises(ValueError, match="dequantized to BF16"):
+        method.apply(layer, x, block_scale=torch.ones(8, k // 32, device="cuda"))

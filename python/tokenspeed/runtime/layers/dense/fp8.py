@@ -22,6 +22,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import functools
+import logging
 
 import torch
 from tokenspeed_kernel.ops.gemm import (
@@ -44,6 +46,51 @@ from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
+logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _warn_once(message: str) -> None:
+    logger.warning(message)
+
+
+def mxfp8_vendor_gemm_available(platform=None) -> bool:
+    """Whether a vendor (not Triton, not torch) GEMM for MXFP8 operands with
+    1x32 UE8M0 scales is registered for ``platform`` (default: this
+    process's). Without one (SM90 today) the portable Triton block-FP8 GEMM
+    is the only kernel, and it runs far below the BF16 GEMM on the same
+    weights, so ``Fp8LinearMethod`` dequantizes such layers at load."""
+    import tokenspeed_kernel.ops.gemm  # noqa: F401  (registers the GEMMs)
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
+
+    scale = ScaleFormat(
+        storage_dtype=torch.uint8, granularity="block", block_shape=(1, 32)
+    )
+    operand = tensor_format("mxfp8", torch.float8_e4m3fn, scale=scale)
+    kernels = KernelRegistry.get().get_for_operator(
+        "gemm",
+        "mm",
+        platform=platform or current_platform(),
+        format_signature=format_signature(a=operand, b=operand),
+    )
+    return any(spec.solution not in ("triton", "torch") for spec in kernels)
+
+
+def dequantize_mxfp8(
+    weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    """``weight`` E4M3 ``[N, K]`` times its UE8M0 scales ``[N, K // 32]``.
+
+    Each value is an E4M3 code times a power of two, so it is exact in BF16
+    (three mantissa bits, the FP32 exponent range).
+    """
+    rows, cols = weight.shape
+    scales = torch.exp2(scale.to(torch.float32) - 127.0)
+    values = weight.to(torch.float32).view(rows, cols // 32, 32) * scales[..., None]
+    return values.view(rows, cols).to(dtype)
+
 
 class Fp8LinearMethod(LinearMethodBase):
     """Load FP8 weights and execute linear layers through quantize_fp8 and mm."""
@@ -51,6 +98,10 @@ class Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        # MXFP8 [1, 32] weights dequantized at load where no vendor GEMM takes
+        # them (mxfp8_vendor_gemm_available); the layer then runs unquantized.
+        self.dequantized = False
+        self._unquantized = None
 
     def create_weights(
         self,
@@ -186,6 +237,14 @@ class Fp8LinearMethod(LinearMethodBase):
             grouped_output_projection_plan = getattr(
                 layer, "_dsv4_grouped_output_projection_plan", None
             )
+            if (
+                grouped_output_projection_plan is None
+                and tuple(self.quant_config.weight_block_size) == (1, 32)
+                and layer.weight_scale_inv.dtype == torch.uint8
+                and not mxfp8_vendor_gemm_available()
+            ):
+                self._dequantize_at_load(layer)
+                return
             if grouped_output_projection_plan is not None:
                 preprocessor = kernel_dsv4_grouped_output_projection_preprocessor(
                     grouped_output_projection_plan
@@ -255,8 +314,26 @@ class Fp8LinearMethod(LinearMethodBase):
                             weight_scale[0].clone(), requires_grad=False
                         )
 
+    def _dequantize_at_load(self, layer: torch.nn.Module) -> None:
+        from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+
+        _warn_once(
+            "MXFP8 linears are dequantized to BF16 at load: no vendor GEMM for "
+            "1x32 UE8M0 scales is registered on this platform"
+        )
+        layer.weight = Parameter(
+            dequantize_mxfp8(
+                layer.weight.data, layer.weight_scale_inv.data, layer.orig_dtype
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("weight_scale_inv", None)
+        self._unquantized = UnquantizedLinearMethod()
+        self._unquantized.process_weights_after_loading(layer)
+        self.dequantized = True
+
     def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
-        if not self.block_quant:
+        if not self.block_quant or self.dequantized:
             return super().apply_into(layer, x, bias, block_scale, output_dtype, out)
         if (
             out.shape != (*x.shape[:-1], layer.weight.shape[0])
@@ -316,6 +393,13 @@ class Fp8LinearMethod(LinearMethodBase):
         block_scale: torch.Tensor | None = None,
         output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        if self.dequantized:
+            if block_scale is not None:
+                raise ValueError(
+                    "An FP8-quantized input reached an MXFP8 linear dequantized to BF16"
+                )
+            output = self._unquantized.apply(layer, x, bias)
+            return output if output_dtype is None else output.to(output_dtype)
         if self.block_quant:
             return self._apply_block(layer, x, bias, block_scale, output_dtype, None)
         else:
