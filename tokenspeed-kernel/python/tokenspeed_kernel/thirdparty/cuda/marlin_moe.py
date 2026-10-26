@@ -22,7 +22,8 @@
 
 Wraps the pre-compiled vendored Marlin MoE kernel (see csrc/marlin_moe/). Only
 the bf16-activation specializations are exported: MXFP4 with E8M0 group-32
-scales is numerically valid only on the bf16 path.
+scales is numerically valid only on the bf16 path. NVFP4 (E4M3 group-16 scales
+plus one global scale per expert) uses the same specializations.
 """
 
 from __future__ import annotations
@@ -130,6 +131,39 @@ def mxfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     return marlin_scales.view(torch.float8_e8m0fnu)
 
 
+def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
+    """Reorder + re-encode permuted NVFP4 scales for the bf16 Marlin path.
+
+    Input is the ``marlin_permute_scales`` output of non-negative E4M3 scales
+    held in bf16. The kernel reads them in the same 4-lane [0,2,1,3] order as
+    MXFP4, re-encoded without a sign bit (S0E5M3): ``scale * 2**7`` in fp16,
+    shifted left by one, keeps the high byte. E4M3 has three mantissa bits,
+    so the re-encoding is exact; the kernel's exponent bias undoes the
+    ``2**7`` together with :func:`nvfp4_marlin_process_global_scale`.
+    """
+    if bool((marlin_scales < 0).any()):
+        raise ValueError("NVFP4 Marlin requires non-negative block scales")
+    marlin_scales = marlin_scales.to(torch.half)
+    marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
+        marlin_scales.size(0), -1
+    )
+    marlin_scales = (marlin_scales * (2**7)).view(torch.int16) << 1
+    marlin_scales = marlin_scales.view(torch.float8_e4m3fn)
+    return marlin_scales[:, 1::2].contiguous()
+
+
+def nvfp4_marlin_process_global_scale(global_scale: torch.Tensor) -> torch.Tensor:
+    """The bf16 per-expert global scale in the form the Marlin epilogue reads.
+
+    The kernel dequantizes E2M1 codes with the bf16 exponent bias shifted by
+    ``2**7 - 2**1``; folding ``2**(126 - 7)`` into the global scale restores
+    the value (a power of two, so exact for normal bf16 inputs).
+    """
+    if global_scale.dtype != torch.bfloat16:
+        raise TypeError(f"global scale must be bf16, got {global_scale.dtype}")
+    return global_scale * (2.0 ** (2**7 - 2**1 - 7))
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -186,6 +220,7 @@ def moe_wna16_marlin_gemm(
     num_tokens_post_padded: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
+    global_scale: torch.Tensor | None,
     moe_block_size: int,
     top_k: int,
     mul_topk_weights: bool,
@@ -199,21 +234,27 @@ def moe_wna16_marlin_gemm(
 
     Computes ``c[route] = a[token(route)] @ dequant(b_q_weight[expert(route)])``
     for every route produced by ``moe_align_block_size``-style scheduling.
-    MXFP4 weights only (E2M1 packed, E8M0 group-32 scales); activation stays
-    bf16 (W4A16 -- no FP4 tensor cores needed, runs on SM90).
+    E2M1 packed weights with E8M0 group-32 scales (MXFP4) or E4M3 group-16
+    scales plus a per-expert global scale (NVFP4); activation stays bf16
+    (W4A16 -- no FP4 tensor cores needed, runs on SM90).
 
     Args:
         a: bf16 activations ``[size_m, size_k]``.
         c: Optional output ``[size_m * top_k, size_n]``; allocated when None.
             Must be zero-filled by the caller if experts can be masked (EP).
         b_q_weight: Marlin-repacked weights ``[E, size_k/16, size_n*2]`` int32.
-        b_scales: Marlin-permuted scales ``[E, size_k/32, size_n]``
-            float8_e8m0fnu.
+        b_scales: Marlin-permuted scales: ``[E, size_k/32, size_n]``
+            float8_e8m0fnu (MXFP4) or ``[E, size_k/16, size_n]`` float8_e4m3fn
+            from :func:`nvfp4_marlin_process_scales` (NVFP4).
         workspace: int32 lock array from :func:`marlin_make_workspace`.
         sorted_token_ids: Routes padded per expert to ``moe_block_size``.
         expert_ids: Expert id per scheduled block.
         num_tokens_post_padded: Total scheduled routes after padding.
         topk_weights: ``[size_m, top_k]`` float32 route weights.
+        global_scale: NVFP4 per-expert ``[E]`` bf16 scales from
+            :func:`nvfp4_marlin_process_global_scale`, applied in the epilogue
+            (folded into the route weights when ``mul_topk_weights``); None
+            for MXFP4.
         moe_block_size: Token block size used by the alignment step (8-64).
         top_k: Routes per token.
         mul_topk_weights: Scale outputs by ``topk_weights`` (GEMM2 finalize).
@@ -262,7 +303,7 @@ def moe_wna16_marlin_gemm(
         b_q_weight,
         empty_a,  # b_bias
         b_scales,
-        empty_a,  # global_scale
+        empty_a if global_scale is None else global_scale,
         empty_a,  # b_zeros
         empty_i32,  # g_idx
         empty_i32,  # perm

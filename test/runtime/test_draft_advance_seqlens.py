@@ -346,6 +346,38 @@ def test_msa_hybrid_fans_pool_binding_out_to_both_routers():
     assert sparse.cache_pool is pool
 
 
+@pytest.mark.parametrize("full_attn_backend_name", [None, "mha", "fa3", "triton"])
+def test_msa_hybrid_dense_layers_build_on_mha_leaves(full_attn_backend_name):
+    """MiniMax's dense layers run on the MHA leaf named by --attention-backend,
+    or the default MHA leaf without it (SM90 has no trtllm leaf)."""
+    spec = MSAConfig(
+        backend_name="msa",
+        full_attn_backend_name=full_attn_backend_name,
+        num_attention_heads=8,
+        num_kv_heads=8,
+        head_dim=128,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        prefix_granularity=64,
+        kernel_page_size=64,
+        context_len=4096,
+        max_bs=8,
+        kv_cache_quant_method="none",
+        components=(spec,),
+    )
+    backend = MSAHybridAttnBackend(config, spec)
+
+    # The router builds its leaf when the cache pool binds; build it directly.
+    leaf = backend.full_router._leaf_factory("full", 64)
+
+    assert type(leaf) is MHAAttnBackend
+    assert leaf.skip_softmax_threshold == 0.0
+
+
 @pytest.mark.parametrize("backend_cls", [MHAAttnBackend, TRTLLMMHAAttnBackend])
 def test_capture_seeds_owned_seqlens(backend_cls):
     """Capture must seed the owned buffer: the capture run reads it.

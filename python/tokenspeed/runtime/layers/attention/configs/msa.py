@@ -48,6 +48,8 @@ class MSAConfig(SoftmaxAttnConfig):
     """
 
     full_attn_backend_name: str | None = None
+    # The dense layers run on an MHA leaf, which reads this knob (MHAConfig).
+    skip_softmax_threshold: float = 0.0
 
     # Compute-layer labels select dense versus sparse execution. The inherited
     # cache_layer_types stay empty because every MiniMax layer retains full
@@ -101,6 +103,7 @@ class MSAConfig(SoftmaxAttnConfig):
                 if not is_draft
                 else server_args.drafter_attention_backend
             ),
+            skip_softmax_threshold=server_args.skip_softmax_threshold,
             num_attention_heads=model_config.num_attention_heads,
             num_kv_heads=model_config.num_key_value_heads,
             head_dim=model_config.head_dim,

@@ -431,10 +431,13 @@ class MSAHybridAttnBackend(AttentionBackend):
         )
 
         super().__init__(config, spec)
+        # Without --attention-backend the dense layers take the MHA leaf, as
+        # their cache producer name says (registry._cache_backend_name); the
+        # spec's own backend_name names this composite, not a dense leaf.
         self.full_router = create_paged_router(
             config,
             AttentionArch.MHA,
-            backend_name=spec.full_attn_backend_name,
+            backend_name=spec.full_attn_backend_name or "mha",
         )
         self.sparse_router = create_paged_router(
             config,

@@ -18,14 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Marlin W4A16 MXFP4 MoE apply for SM90 (Hopper).
+"""Marlin W4A16 MXFP4 and NVFP4 MoE apply for SM90 (Hopper).
 
-Weight-only 4-bit experts: MXFP4 (E2M1 packed, E8M0 group-32 scales) weights
+Weight-only 4-bit experts: MXFP4 (E2M1 packed, E8M0 group-32 scales) and
+NVFP4 (E2M1 packed, E4M3 group-16 scales, one global scale per expert) weights
 are dequantized inside the Marlin grouped GEMM; activations stay bf16, so no
-FP4 tensor cores are required. This is the Hopper path for Kimi-K3, whose
+FP4 tensor cores are required. MXFP4 is the Hopper path for Kimi-K3, whose
 routed experts use the SiTU gated activation (applied as a fused Triton
-epilogue between the two GEMMs). Routing is precomputed upstream (the K3 gate
-the fused kernels cannot reproduce).
+epilogue between the two GEMMs). NVFP4 is the Hopper path for NVFP4
+checkpoints, such as MiniMax-M3.1's routed experts. Routing is precomputed
+upstream (the K3 gate the fused kernels cannot reproduce).
 
 The kernel and its weight repack use the vendored Marlin MoE; the grouped GEMM
 lives in ``thirdparty/cuda/csrc/marlin_moe`` and is pre-compiled.
@@ -33,8 +35,10 @@ lives in ``thirdparty/cuda/csrc/marlin_moe`` and is pre-compiled.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
-from tokenspeed_kernel.ops.activation.triton import situ_and_mul
+from tokenspeed_kernel.ops.activation.triton import situ_and_mul, swiglu_oai
 from tokenspeed_kernel.ops.moe._deep_ep.layout import (
     activate_recv_rows,
     pack_recv_rows,
@@ -50,9 +54,14 @@ from tokenspeed_kernel.thirdparty.cuda.marlin_moe import (
     moe_align_block_size,
     moe_wna16_marlin_gemm,
     mxfp4_marlin_process_scales,
+    nvfp4_marlin_process_global_scale,
+    nvfp4_marlin_process_scales,
 )
 
 MXFP4_BLOCK = 32
+NVFP4_BLOCK = 16
+# Marlin tiles N and K in multiples of 64; GEMM1's N and GEMM2's K are ispp.
+NVFP4_ISPP_ALIGNMENT = 64
 
 
 def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
@@ -131,20 +140,6 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
             f"hidden={hidden}, ispp={ispp}"
         )
 
-    device = w13.device
-    perm = torch.empty(0, dtype=torch.int, device=device)
-
-    def _repack(weight: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
-        # gptq_marlin_repack wants int32 [size_k/pack, size_n]; the packed
-        # uint8 [E, size_n, size_k/2] view transposes to that per expert.
-        out = []
-        for e in range(num_experts):
-            qw = weight[e].view(torch.int32).T.contiguous()
-            out.append(
-                gptq_marlin_repack(qw, perm, size_k=size_k, size_n=size_n, num_bits=4)
-            )
-        return torch.stack(out)
-
     def _permute(scale: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
         out = []
         for e in range(num_experts):
@@ -155,8 +150,8 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
             out.append(mxfp4_marlin_process_scales(permuted))
         return torch.stack(out)
 
-    w13_marlin = _repack(w13, size_n=2 * ispp, size_k=hidden)
-    w2_marlin = _repack(w2, size_n=hidden, size_k=ispp)
+    w13_marlin = _repack_e2m1(w13, size_n=2 * ispp, size_k=hidden)
+    w2_marlin = _repack_e2m1(w2, size_n=hidden, size_k=ispp)
     w13_scale_marlin = _permute(w13_scale, size_n=2 * ispp, size_k=hidden)
     w2_scale_marlin = _permute(w2_scale, size_n=hidden, size_k=ispp)
 
@@ -164,6 +159,154 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     w.w2_weight = torch.nn.Parameter(w2_marlin, requires_grad=False)
     w.w13_weight_scale = torch.nn.Parameter(w13_scale_marlin, requires_grad=False)
     w.w2_weight_scale = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
+    w._marlin_hidden_size = hidden
+    w._marlin_ispp = ispp
+    w._marlin_repacked = True
+
+
+def _repack_e2m1(weight: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
+    """Marlin-repack packed E2M1 experts ``[E, size_n, size_k // 2]`` (uint8)."""
+    # gptq_marlin_repack wants int32 [size_k/pack, size_n]; the packed uint8
+    # [size_n, size_k/2] view of one expert transposes to that.
+    perm = torch.empty(0, dtype=torch.int, device=weight.device)
+    return torch.stack(
+        [
+            gptq_marlin_repack(
+                expert.view(torch.int32).T.contiguous(),
+                perm,
+                size_k=size_k,
+                size_n=size_n,
+                num_bits=4,
+            )
+            for expert in weight
+        ]
+    )
+
+
+def _nvfp4_marlin_scales(scale: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
+    """Permute and re-encode E4M3 block scales ``[E, size_n, size_k // 16]``."""
+    return torch.stack(
+        [
+            nvfp4_marlin_process_scales(
+                marlin_permute_scales(
+                    expert.T.contiguous().to(torch.bfloat16),
+                    size_k=size_k,
+                    size_n=size_n,
+                    group_size=NVFP4_BLOCK,
+                )
+            )
+            for expert in scale
+        ]
+    )
+
+
+def _generalized_swiglu(w: torch.nn.Module) -> tuple[float, float] | None:
+    """``(alpha, limit)`` of a SwiGLU-OAI layer, or None for standard SwiGLU.
+
+    SwiGLU-OAI is ``gate * sigmoid(alpha * gate) * (up + 1)`` with ``gate``
+    clamped from above and ``up`` on both sides (gpt-oss, MiniMax-M3); it
+    runs as the ``swiglu_oai`` epilogue. Any other up-branch offset has no
+    epilogue and is rejected.
+    """
+    swiglu_arg = getattr(w, "swiglu_arg", None)
+    alpha = None if swiglu_arg is None else getattr(swiglu_arg, "alpha", None)
+    beta = getattr(w, "swiglu_beta", None)
+    if alpha in (None, 1.0) and beta in (None, 0.0):
+        return None
+    limit = None if swiglu_arg is None else getattr(swiglu_arg, "limit", None)
+    if beta != 1.0 or limit is None:
+        raise ValueError(
+            "Marlin NVFP4 MoE supports SwiGLU-OAI (swiglu_beta=1 with a clamp "
+            f"limit) as its generalized SwiGLU; got alpha={alpha!r}, "
+            f"swiglu_beta={beta!r}, limit={limit!r}"
+        )
+    return (1.0 if alpha is None else float(alpha)), float(limit)
+
+
+def marlin_nvfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
+    """Repack loader-format NVFP4 experts into the Marlin layout, once.
+
+    Input (from the nvfp4 weight loader): ``w13_weight``/``w2_weight`` packed
+    E2M1 as uint8 ``[E, N, K//2]``, ``w13_weight_scale``/``w2_weight_scale``
+    E4M3 ``[E, N, K//16]``, and the global scales ``w13_weight_scale_2``
+    (``[E, 2]``, gate and up) and ``w2_weight_scale_2`` (``[E]``); a weight is
+    ``e2m1 * block_scale * global_scale``. Marlin applies one global scale per
+    expert and GEMM, so the gate and up scales must be equal, as in
+    checkpoints that quantize the fused gate/up projection (MiniMax-M3.1).
+    The kernel reads the global scales in bf16. Activation input scales are
+    unused: activations stay bf16.
+
+    Output: Marlin-repacked int32 weights, re-encoded E4M3 scales and bf16
+    kernel-form global scales ``[E]``, written back under the same names.
+    """
+    names = (
+        "w13_weight",
+        "w13_weight_scale",
+        "w13_weight_scale_2",
+        "w2_weight",
+        "w2_weight_scale",
+        "w2_weight_scale_2",
+    )
+    if any(not hasattr(w, name) for name in names):
+        raise ValueError("NVFP4 MoE weights are incomplete for Marlin repack")
+    if getattr(w, "_marlin_repacked", False):
+        return
+
+    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    if activation not in {"silu", "swiglu"}:
+        raise ValueError(f"Marlin NVFP4 MoE does not support activation {activation!r}")
+    _generalized_swiglu(w)  # reject unsupported SwiGLU forms before repacking
+
+    w13 = w.w13_weight.data
+    w2 = w.w2_weight.data
+    num_experts = w13.shape[0]
+    two_ispp = w13.shape[1]
+    hidden = w13.shape[2] * 2
+    ispp = w2.shape[2] * 2
+    if two_ispp != 2 * ispp:
+        raise ValueError(
+            f"w13/w2 intermediate mismatch: w13 {two_ispp} vs 2*ispp {2 * ispp}"
+        )
+    if hidden % 128 != 0 or ispp % NVFP4_ISPP_ALIGNMENT != 0:
+        raise ValueError(
+            f"Marlin NVFP4 needs hidden%128==0 and ispp%{NVFP4_ISPP_ALIGNMENT}==0, "
+            f"got hidden={hidden}, ispp={ispp}"
+        )
+
+    w13_global = w.w13_weight_scale_2.data.to(torch.float32)
+    if w13_global.dim() == 2:
+        if not torch.equal(w13_global[:, 0], w13_global[:, 1]):
+            raise ValueError(
+                "Marlin NVFP4 MoE needs one global scale per expert for the gate "
+                "and up projections; this checkpoint quantized them separately"
+            )
+        w13_global = w13_global[:, 0]
+    w2_global = w.w2_weight_scale_2.data.to(torch.float32)
+    if w13_global.shape != (num_experts,) or w2_global.shape != (num_experts,):
+        raise ValueError("NVFP4 global scales must hold one value per expert")
+
+    w.w13_weight = torch.nn.Parameter(
+        _repack_e2m1(w13, size_n=2 * ispp, size_k=hidden), requires_grad=False
+    )
+    w.w2_weight = torch.nn.Parameter(
+        _repack_e2m1(w2, size_n=hidden, size_k=ispp), requires_grad=False
+    )
+    w.w13_weight_scale = torch.nn.Parameter(
+        _nvfp4_marlin_scales(w.w13_weight_scale.data, size_n=2 * ispp, size_k=hidden),
+        requires_grad=False,
+    )
+    w.w2_weight_scale = torch.nn.Parameter(
+        _nvfp4_marlin_scales(w.w2_weight_scale.data, size_n=hidden, size_k=ispp),
+        requires_grad=False,
+    )
+    w.w13_weight_scale_2 = torch.nn.Parameter(
+        nvfp4_marlin_process_global_scale(w13_global.to(torch.bfloat16)),
+        requires_grad=False,
+    )
+    w.w2_weight_scale_2 = torch.nn.Parameter(
+        nvfp4_marlin_process_global_scale(w2_global.to(torch.bfloat16)),
+        requires_grad=False,
+    )
     w._marlin_hidden_size = hidden
     w._marlin_ispp = ispp
     w._marlin_repacked = True
@@ -241,33 +384,34 @@ def marlin_mxfp4_precomputed_moe_apply(
     if x.dtype != torch.bfloat16:
         raise TypeError(f"Marlin MXFP4 MoE requires bf16 activations, got {x.dtype}")
 
+    return marlin_mxfp4_local_moe_apply(
+        plan, x, w, topk_weights, _local_topk_ids(w, topk_ids)
+    )
+
+
+def _local_topk_ids(w: torch.nn.Module, topk_ids: torch.Tensor) -> torch.Tensor:
+    """This rank's expert ids for global ``topk_ids``; -1 where another rank owns it."""
     num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
     ep_size = int(getattr(w, "ep_size", 1))
     ep_rank = int(getattr(w, "ep_rank", 0))
     global_num_experts = num_local_experts * ep_size
 
     topk_ids = topk_ids.to(torch.int32)
-    is_ep = ep_size > 1
-    if is_ep:
-        # Global -> local id remap: [expert_start, +num_local) -> [0, num_local),
-        # everything else -> -1 (the align kernel parks these in the extra lane
-        # and the EP GEMM skips those blocks). Inputs may already carry -1 in
-        # masked slots (DeepEP recv layout); clamp before the gather so the
-        # negative index cannot wrap to the mapping's last entry, then restore.
-        expert_start = ep_rank * num_local_experts
-        mapping = torch.full(
-            (global_num_experts,), -1, dtype=torch.int32, device=topk_ids.device
-        )
-        mapping[expert_start : expert_start + num_local_experts] = torch.arange(
-            num_local_experts, dtype=torch.int32, device=topk_ids.device
-        )
-        local_topk_ids = torch.where(
-            topk_ids < 0, topk_ids, mapping[topk_ids.long().clamp_(min=0)]
-        )
-    else:
-        local_topk_ids = topk_ids
-
-    return marlin_mxfp4_local_moe_apply(plan, x, w, topk_weights, local_topk_ids)
+    if ep_size == 1:
+        return topk_ids
+    # Global -> local id remap: [expert_start, +num_local) -> [0, num_local),
+    # everything else -> -1 (the align kernel parks these in the extra lane
+    # and the EP GEMM skips those blocks). Inputs may already carry -1 in
+    # masked slots (DeepEP recv layout); clamp before the gather so the
+    # negative index cannot wrap to the mapping's last entry, then restore.
+    expert_start = ep_rank * num_local_experts
+    mapping = torch.full(
+        (global_num_experts,), -1, dtype=torch.int32, device=topk_ids.device
+    )
+    mapping[expert_start : expert_start + num_local_experts] = torch.arange(
+        num_local_experts, dtype=torch.int32, device=topk_ids.device
+    )
+    return torch.where(topk_ids < 0, topk_ids, mapping[topk_ids.long().clamp_(min=0)])
 
 
 def marlin_mxfp4_local_moe_apply(
@@ -295,6 +439,51 @@ def marlin_mxfp4_local_moe_apply(
         raise TypeError(f"Marlin MXFP4 MoE requires bf16 activations, got {x.dtype}")
 
     activation = plan.get("activation") or getattr(w, "activation", "silu")
+
+    def activate(gate_up: torch.Tensor) -> torch.Tensor:
+        if activation == "situ":
+            beta_attr = getattr(w, "activation_situ_beta", None)
+            beta = 1.0 if beta_attr is None else float(beta_attr)
+            linear_beta = getattr(w, "activation_situ_linear_beta", None)
+            return situ_and_mul(
+                gate_up,
+                beta=beta,
+                linear_beta=None if linear_beta is None else float(linear_beta),
+            )
+        from tokenspeed_kernel.ops.activation.triton import silu_and_mul
+
+        return silu_and_mul(gate_up, limit=_swiglu_limit(w))
+
+    return _marlin_routed_experts(
+        x, w, topk_weights, local_topk_ids, activate=activate, global_scales=None
+    )
+
+
+def _marlin_routed_experts(
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    topk_weights: torch.Tensor,
+    local_topk_ids: torch.Tensor,
+    *,
+    activate: Callable[[torch.Tensor], torch.Tensor],
+    global_scales: tuple[torch.Tensor, torch.Tensor] | None,
+) -> torch.Tensor:
+    """GEMM1, ``activate``, GEMM2 over Marlin-repacked local experts.
+
+    Args:
+        x: BF16 input rows ``[tokens, hidden]``.
+        w: Marlin-repacked weights and expert geometry.
+        topk_weights: ``[tokens, top_k]`` route weights, applied in GEMM2.
+        local_topk_ids: ``[tokens, top_k]`` local expert ids, -1 for routes
+            other ranks own.
+        activate: Maps GEMM1's ``[routes, 2 * ispp]`` output to ``[routes, ispp]``.
+        global_scales: NVFP4 kernel-form ``(w13, w2)`` per-expert global
+            scales, or None for MXFP4.
+
+    Returns:
+        ``[tokens, hidden]`` sums over this rank's routes.
+    """
+    w13_global, w2_global = (None, None) if global_scales is None else global_scales
     hidden = int(getattr(w, "_marlin_hidden_size", x.shape[1]))
     ispp = int(getattr(w, "_marlin_ispp", w.w2_weight.shape[1] * 16))
     num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
@@ -320,6 +509,7 @@ def marlin_mxfp4_local_moe_apply(
         expert_ids,
         num_tokens_post_padded,
         topk_weights,
+        global_scale=w13_global,
         moe_block_size=block_m,
         top_k=top_k,
         mul_topk_weights=False,
@@ -329,19 +519,7 @@ def marlin_mxfp4_local_moe_apply(
         size_k=hidden,
     ).view(-1, gemm1_n)
 
-    if activation == "situ":
-        beta_attr = getattr(w, "activation_situ_beta", None)
-        beta = 1.0 if beta_attr is None else float(beta_attr)
-        linear_beta = getattr(w, "activation_situ_linear_beta", None)
-        intermediate2 = situ_and_mul(
-            intermediate1,
-            beta=beta,
-            linear_beta=None if linear_beta is None else float(linear_beta),
-        )
-    else:
-        from tokenspeed_kernel.ops.activation.triton import silu_and_mul
-
-        intermediate2 = silu_and_mul(intermediate1, limit=_swiglu_limit(w))
+    intermediate2 = activate(intermediate1)
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
     # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.
@@ -355,6 +533,7 @@ def marlin_mxfp4_local_moe_apply(
         expert_ids,
         num_tokens_post_padded,
         topk_weights,
+        global_scale=w2_global,
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=True,
@@ -365,6 +544,98 @@ def marlin_mxfp4_local_moe_apply(
     ).view(num_tokens, top_k, hidden)
 
     return intermediate3.sum(dim=1)
+
+
+@register_kernel(
+    "moe",
+    "apply",
+    name="marlin_nvfp4_precomputed_moe_apply",
+    solution="marlin",
+    weight_preprocessor=marlin_nvfp4_moe_weights,
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 0),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={
+        "weight_dtype": frozenset({"nvfp4"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        # Standard SwiGLU, or SwiGLU-OAI through swiglu_oai (_generalized_swiglu).
+        "swiglu_form": frozenset({"standard", "generalized"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({NVFP4_ISPP_ALIGNMENT}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+)
+def marlin_nvfp4_precomputed_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Apply a Marlin W4A16 NVFP4 MoE with precomputed routing.
+
+    Args:
+        plan: MoE plan; ``activation`` is ``silu`` or ``swiglu``. Standard
+            SwiGLU computes ``silu(gate) * up`` clamped to
+            ``w.swiglu_arg.limit`` when set; SwiGLU-OAI (``w.swiglu_beta`` 1,
+            ``w.swiglu_arg.alpha``) computes
+            ``gate * sigmoid(alpha * gate) * (up + 1)`` with the same clamps.
+        x: bf16 hidden states ``[tokens, hidden]``.
+        w: Module holding the outputs of :func:`marlin_nvfp4_moe_weights`
+            plus ``num_local_experts``/``ep_size``/``ep_rank`` for EP.
+        router_logits: Unused; routing is precomputed.
+        topk_weights: Route weights ``[tokens, top_k]``; the kernel multiplies
+            them in bf16 together with the expert's global scale.
+        topk_ids: Global expert ids ``[tokens, top_k]``; in EP, ids other
+            ranks own contribute zero.
+        num_tokens_global: Unused; distributed EP dispatch is not owned here.
+        max_num_tokens_per_gpu: Unused capacity hint.
+        do_finalize: Must be true (no deferred finalize).
+        enable_pdl: Unused launch hint.
+
+    Returns:
+        Finalized hidden states ``[tokens, hidden]`` in the dtype of ``x``.
+    """
+    del router_logits, num_tokens_global, max_num_tokens_per_gpu, enable_pdl
+    if not do_finalize:
+        raise ValueError("Marlin NVFP4 MoE cannot defer finalization")
+    if topk_weights is None or topk_ids is None:
+        raise ValueError("Marlin NVFP4 MoE requires precomputed top-k")
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"Marlin NVFP4 MoE requires bf16 activations, got {x.dtype}")
+
+    oai = _generalized_swiglu(w)
+    swiglu_arg = getattr(w, "swiglu_arg", None)
+    limit = None if swiglu_arg is None else getattr(swiglu_arg, "limit", None)
+
+    def activate(gate_up: torch.Tensor) -> torch.Tensor:
+        if oai is not None:
+            alpha, oai_limit = oai
+            return swiglu_oai(gate_up, alpha=alpha, limit=oai_limit)
+        from tokenspeed_kernel.ops.activation.triton import silu_and_mul
+
+        return silu_and_mul(gate_up, limit=None if limit is None else float(limit))
+
+    return _marlin_routed_experts(
+        x,
+        w,
+        topk_weights,
+        _local_topk_ids(w, topk_ids),
+        activate=activate,
+        global_scales=(w.w13_weight_scale_2, w.w2_weight_scale_2),
+    )
 
 
 def marlin_mxfp4_masked_moe_apply(
@@ -419,6 +690,7 @@ def marlin_mxfp4_masked_moe_apply(
         expert_ids,
         total,
         weights,
+        global_scale=None,
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=False,
@@ -448,6 +720,7 @@ def marlin_mxfp4_masked_moe_apply(
         expert_ids,
         total,
         weights,
+        global_scale=None,
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=False,

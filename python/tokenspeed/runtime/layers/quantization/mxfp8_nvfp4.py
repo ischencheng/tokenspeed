@@ -79,7 +79,8 @@ class Mxfp8Nvfp4Config(Mxfp8Config):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100  # NVFP4 experts require Blackwell
+        # SM90 runs the NVFP4 experts through the Marlin W4A16 MoE.
+        return 90
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> Mxfp8Nvfp4Config:
