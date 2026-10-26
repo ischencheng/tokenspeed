@@ -29,6 +29,7 @@ the routes in FP32. Runs on SM90+.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 import pytest
@@ -39,11 +40,10 @@ from tokenspeed_kernel.numerics.torch.activation import (
 )
 from tokenspeed_kernel.numerics.torch.quantization import dequantize_nvfp4_blocks
 from tokenspeed_kernel.ops.activation.triton import _swiglu_oai_kernel
-from tokenspeed_kernel.ops.moe.marlin import (
-    marlin_nvfp4_moe_weights,
-    marlin_nvfp4_precomputed_moe_apply,
-)
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
+from tokenspeed_kernel.ops.moe.marlin import marlin_nvfp4_moe_weights
+from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 from utils import assert_no_triton_compile
 
 
@@ -189,10 +189,53 @@ _ACTIVATIONS = {
 }
 
 
-def _apply(raw, x, topk_ids, topk_weights, swiglu_arg, swiglu_beta, *, ep_size=1):
+def _plan(
+    num_experts: int,
+    top_k: int,
+    hidden: int,
+    ispp: int,
+    activation: str,
+    *,
+    ep_size: int,
+    solution: str | None,
+) -> dict:
+    swiglu_arg, _, _ = _ACTIVATIONS[activation]
+    return moe_plan(
+        "nvfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        ep_size=ep_size,
+        ispp=ispp,
+        hidden=hidden,
+        swiglu_form="generalized" if activation == "swiglu_oai" else "standard",
+        activation_clamped=swiglu_arg is not None and swiglu_arg.limit is not None,
+        expert_id_repeats=False,
+        num_experts=num_experts,
+        top_k=top_k,
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+        solution=solution,
+    )
+
+
+def _apply(raw, x, topk_ids, topk_weights, activation, *, ep_size=1):
+    """Plan, preprocess and apply through the public MoE ops, one rank at a time."""
     num_experts = raw["w13_weight"].shape[0]
     num_local = num_experts // ep_size
-    plan = {"activation": "swiglu"}
+    hidden = raw["w13_weight"].shape[2] * 2
+    ispp = raw["w2_weight"].shape[2] * 2
+    swiglu_arg, swiglu_beta, _ = _ACTIVATIONS[activation]
+    plan = _plan(
+        num_experts,
+        topk_ids.shape[1],
+        hidden,
+        ispp,
+        activation,
+        ep_size=ep_size,
+        solution="marlin",
+    )
     out = torch.zeros_like(x, dtype=torch.float32)
     for ep_rank in range(ep_size):
         shard = {
@@ -207,8 +250,8 @@ def _apply(raw, x, topk_ids, topk_weights, swiglu_arg, swiglu_beta, *, ep_size=1
             swiglu_arg=swiglu_arg,
             swiglu_beta=swiglu_beta,
         )
-        marlin_nvfp4_moe_weights(plan, w)
-        out += marlin_nvfp4_precomputed_moe_apply(
+        moe_process_weights(plan, w)
+        out += moe_apply(
             plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
         ).float()
     return out
@@ -220,7 +263,7 @@ def test_marlin_nvfp4_matches_reference(activation: str, num_tokens: int) -> Non
     _requires_sm90()
     generator = torch.Generator(device="cuda").manual_seed(7)
     num_experts, top_k, hidden, ispp = 16, 4, 512, 192
-    swiglu_arg, swiglu_beta, torch_activation = _ACTIVATIONS[activation]
+    _, _, torch_activation = _ACTIVATIONS[activation]
     raw = _make_nvfp4_experts(num_experts, hidden, ispp, generator)
     x = (torch.randn(num_tokens, hidden, device="cuda", generator=generator) * 0.25).to(
         torch.bfloat16
@@ -228,7 +271,7 @@ def test_marlin_nvfp4_matches_reference(activation: str, num_tokens: int) -> Non
     topk_ids, topk_weights = _routes(num_tokens, top_k, num_experts, generator)
 
     expected = _reference(x, raw, topk_ids, topk_weights, torch_activation)
-    actual = _apply(raw, x, topk_ids, topk_weights, swiglu_arg, swiglu_beta)
+    actual = _apply(raw, x, topk_ids, topk_weights, activation)
 
     _check(actual, expected)
 
@@ -239,7 +282,7 @@ def test_marlin_nvfp4_ep_ranks_sum_to_reference(ep_size: int) -> None:
     _requires_sm90()
     generator = torch.Generator(device="cuda").manual_seed(13)
     num_experts, top_k, hidden, ispp, num_tokens = 16, 4, 512, 192, 48
-    swiglu_arg, swiglu_beta, torch_activation = _ACTIVATIONS["swiglu_oai"]
+    _, _, torch_activation = _ACTIVATIONS["swiglu_oai"]
     raw = _make_nvfp4_experts(num_experts, hidden, ispp, generator)
     x = (torch.randn(num_tokens, hidden, device="cuda", generator=generator) * 0.25).to(
         torch.bfloat16
@@ -247,9 +290,7 @@ def test_marlin_nvfp4_ep_ranks_sum_to_reference(ep_size: int) -> None:
     topk_ids, topk_weights = _routes(num_tokens, top_k, num_experts, generator)
 
     expected = _reference(x, raw, topk_ids, topk_weights, torch_activation)
-    actual = _apply(
-        raw, x, topk_ids, topk_weights, swiglu_arg, swiglu_beta, ep_size=ep_size
-    )
+    actual = _apply(raw, x, topk_ids, topk_weights, "swiglu_oai", ep_size=ep_size)
 
     _check(actual, expected)
 
@@ -302,17 +343,17 @@ def test_marlin_nvfp4_token_counts_reuse_the_epilogue_binary() -> None:
         swiglu_arg=swiglu_arg,
         swiglu_beta=swiglu_beta,
     )
-    plan = {"activation": "swiglu"}
-    marlin_nvfp4_moe_weights(plan, w)
+    plan = _plan(
+        num_experts, top_k, hidden, ispp, "swiglu_oai", ep_size=1, solution="marlin"
+    )
+    moe_process_weights(plan, w)
 
     def run(num_tokens: int) -> None:
         x = torch.randn(num_tokens, hidden, device="cuda", generator=generator).to(
             torch.bfloat16
         )
         topk_ids, topk_weights = _routes(num_tokens, top_k, num_experts, generator)
-        marlin_nvfp4_precomputed_moe_apply(
-            plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
-        )
+        moe_apply(plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids)
 
     run(3)
     run(16)
@@ -320,6 +361,26 @@ def test_marlin_nvfp4_token_counts_reuse_the_epilogue_binary() -> None:
         for num_tokens in (1, 5, 32, 77, 128, 513):
             run(num_tokens)
     torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("activation", ["swiglu_oai", "swiglu_limit"])
+@pytest.mark.parametrize("ispp,selected", [(64, True), (384, True), (32, False)])
+def test_sm90_planner_selects_marlin_for_nvfp4_experts(activation, ispp, selected):
+    """On SM90 Marlin is the NVFP4 expert kernel, for intermediate sizes per
+    partition that are multiples of 64 (MiniMax-M3.1 TP8 is 384)."""
+    original = current_platform()
+    Platform.override(
+        dataclasses.replace(original, vendor="nvidia", arch_version=ArchVersion(9, 0))
+    )
+    try:
+        if selected:
+            plan = _plan(128, 4, 6144, ispp, activation, ep_size=1, solution=None)
+            assert plan["apply_kernel_name"] == "marlin_nvfp4_precomputed_moe_apply"
+        else:
+            with pytest.raises(NoKernelFoundError):
+                _plan(128, 4, 6144, ispp, activation, ep_size=1, solution=None)
+    finally:
+        Platform.override(original)
 
 
 def _check(actual: torch.Tensor, expected: torch.Tensor) -> None:

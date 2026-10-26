@@ -120,5 +120,9 @@ def test_sm90_dequantizes_mxfp8_linears_to_exact_bf16() -> None:
     torch.testing.assert_close(
         out, ref, atol=two_ulps * ref.abs().max().item(), rtol=two_ulps
     )
+    # A caller-owned FP32 destination receives the same values.
+    out_fp32 = torch.empty(8, n, device="cuda", dtype=torch.float32)
+    assert method.apply_into(layer, x, None, None, torch.float32, out_fp32) is out_fp32
+    torch.testing.assert_close(out_fp32, out, atol=0, rtol=0)
     with pytest.raises(ValueError, match="dequantized to BF16"):
         method.apply(layer, x, block_scale=torch.ones(8, k // 32, device="cuda"))

@@ -333,7 +333,17 @@ class Fp8LinearMethod(LinearMethodBase):
         self.dequantized = True
 
     def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
-        if not self.block_quant or self.dequantized:
+        if self.dequantized:
+            output = self.apply(layer, x, bias, block_scale, output_dtype)
+            if (
+                out.shape != output.shape
+                or out.dtype != output.dtype
+                or out.device != output.device
+            ):
+                raise ValueError("Linear destination must match the computed output")
+            out.copy_(output)
+            return out
+        if not self.block_quant:
             return super().apply_into(layer, x, bias, block_scale, output_dtype, out)
         if (
             out.shape != (*x.shape[:-1], layer.weight.shape[0])

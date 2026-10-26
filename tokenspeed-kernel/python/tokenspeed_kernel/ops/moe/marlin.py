@@ -576,13 +576,13 @@ def marlin_nvfp4_precomputed_moe_apply(
     plan: dict,
     x: torch.Tensor,
     w: torch.nn.Module,
-    router_logits: torch.Tensor,
-    topk_weights: torch.Tensor | None = None,
-    topk_ids: torch.Tensor | None = None,
-    num_tokens_global: int | None = None,
-    max_num_tokens_per_gpu: int | None = None,
-    do_finalize: bool = True,
-    enable_pdl: bool = False,
+    router_logits: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    num_tokens_global: int | None,
+    max_num_tokens_per_gpu: int | None,
+    do_finalize: bool,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Apply a Marlin W4A16 NVFP4 MoE with precomputed routing.
 
