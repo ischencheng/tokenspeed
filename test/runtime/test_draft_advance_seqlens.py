@@ -360,7 +360,6 @@ def test_msa_hybrid_dense_layers_build_on_mha_leaves(full_attn_backend_name):
         device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        prefix_granularity=64,
         kernel_page_size=64,
         context_len=4096,
         max_bs=8,
