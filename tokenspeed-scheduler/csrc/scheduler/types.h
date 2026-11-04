@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 
@@ -58,16 +59,34 @@ struct SchedulerConfig {
     std::int32_t debug_force_retraction_interval{0};
 
     std::vector<CacheGroupConfig> cache_groups{};
+    // Virtual children per compact Host parent, shared by L2 and snapshots.
+    // Required when either Host pool exists; no capacity is reserved by group.
+    std::vector<std::int32_t> host_group_packing{};
 
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
     bool HasSnapshotPool() const { return snapshot_allocator.total_pages > 1; }
 
+    // What feeds Host L2 from ordinary Device prefix entries; required with a
+    // Host tier (Validate says where kWriteBack may run).
+    //   kWriteThrough  published entries stream to Host at chunk ends, the
+    //                  prompt end and finish.
+    //   kWriteBack     nothing streams at publication: what an admission
+    //                  or a restore evicts is written back to Host in the
+    //                  same plan, by whole segments.
+    enum class HostWritePolicy : std::uint8_t { kUnspecified, kWriteThrough, kWriteBack };
+    HostWritePolicy host_write_policy{HostWritePolicy::kUnspecified};
+
     // The D role streams no ordinary Device cache entry to Host; its Host
     // cache holds only the published pages of retracted requests (the image's
     // L2 leg) until they are restored.
-    bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD; }
+    bool StreamsDeviceCacheToHost() const {
+        return HasHostCache() && role != Role::kD && host_write_policy == HostWritePolicy::kWriteThrough;
+    }
 
     std::int32_t max_scheduled_tokens{};
+    // Sum of ceil((cached prefix + this chunk) / prefix_granularity) across
+    // all local prefill requests in one batch. Zero leaves this unbounded.
+    std::int32_t max_kv_page_num{0};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the
@@ -97,9 +116,30 @@ struct SchedulerConfig {
     // forward holds one more block per State group, and the request's next
     // publication point publishes it under the boundary's page hash. The
     // runtime writes the state at ForwardBatch::extend_state_checkpoint_lens
-    // into the third entry of every State group's row. Requires prefix
-    // caching, except on the D role, which never computes a prompt.
+    // into the third entry of every State group's row. The State checkpoints,
+    // and their KV tails, that a next turn re-rendering the end of the
+    // previous prompt and its reply cannot resume at are then skipped: a
+    // prompt end that checkpoint covers (P and fused roles) and a fused finish
+    // past the prompt end are published like chunk ends
+    // (docs/design/scheduler.md §1.2). A model without State groups is
+    // unaffected. Requires prefix caching, except on the D role, which never
+    // computes a prompt and publishes as ever.
     bool state_checkpoint_in_forward{false};
+    // Under cache pressure, a State checkpoint more than
+    // checkpoint_retention_leaf_distance from the newest checkpoint on its
+    // branch ranks as if last used this many new requests ago, or at its own
+    // use when older: so it leaves before the entries used since, while entries
+    // unused for longer leave first. 0 ranks every entry by its own use. Unset
+    // means 16 * max_batch_size; at most kMaxCheckpointRetentionRequests.
+    std::optional<std::int64_t> checkpoint_retention_requests;
+    // Checkpoints within this many later requests of the newest on their
+    // branch rank as it does: 0 only the newest request's, 1 the previous
+    // turn's too. Below CheckpointTree::kMaxDistance.
+    std::int32_t checkpoint_retention_leaf_distance{0};
+    std::int64_t CheckpointRetentionRequests() const {
+        return checkpoint_retention_requests.value_or(
+            std::min<std::int64_t>(std::int64_t{16} * max_batch_size, kMaxCheckpointRetentionRequests));
+    }
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

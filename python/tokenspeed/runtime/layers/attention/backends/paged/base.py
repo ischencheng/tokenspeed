@@ -49,7 +49,6 @@ from tokenspeed.runtime.layers.attention.backends.support import (
     CudaGraphSupport,
     TreeSupport,
 )
-from tokenspeed.runtime.layers.attention.chunk import prefix_chunk_len
 from tokenspeed.runtime.layers.attention.dcp.cache import PrefixHistoryGather
 from tokenspeed.runtime.utils.common import ceil_div
 
@@ -104,6 +103,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
     supports_mla_dcp: bool = False
+    prefill_needs_host_page_table: bool = False
 
     @classmethod
     def resolve_kernel_page_size(
@@ -531,7 +531,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         chunk_kv_indices_list: Sequence[torch.Tensor],
         *,
         page_table_cpu: torch.Tensor | None,
-        prefix_lens_cpu: torch.Tensor,
+        chunk_bounds_cpu: torch.Tensor,
     ) -> None:
         """Record a prefill forward's prefix-chunk loops for
         :meth:`read_prefix_history`.
@@ -545,8 +545,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
             page_table_cpu: ``[requests, columns]`` host kernel-page table of
                 the extend requests; required when the cache is dealt over
                 owners and there are loops.
-            prefix_lens_cpu: ``[requests]`` host cached-prefix lengths of the
-                requests the loops were cut for.
+            chunk_bounds_cpu: ``[loops + 1, requests]`` host prefix positions
+                delimiting exactly the same loops as the slot indices.
         """
         if self._prefix_history is None:
             # A leaf deals every layer's pages the same way.
@@ -559,8 +559,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self._prefix_history.prepare(
             chunk_kv_indices_list,
             page_table_cpu=page_table_cpu,
-            prefix_lens_cpu=prefix_lens_cpu,
-            chunk_len=prefix_chunk_len(len(prefix_lens_cpu)),
+            chunk_bounds_cpu=chunk_bounds_cpu,
         )
 
     def read_prefix_history(

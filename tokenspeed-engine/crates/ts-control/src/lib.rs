@@ -27,6 +27,7 @@
 
 pub mod batch_log;
 pub mod cache_ops;
+pub mod calls;
 mod codec;
 pub mod control;
 pub mod encode;
@@ -41,4 +42,5 @@ pub mod relay;
 pub mod request;
 pub mod request_stats;
 pub mod sampling;
+pub mod trace;
 pub mod transport;

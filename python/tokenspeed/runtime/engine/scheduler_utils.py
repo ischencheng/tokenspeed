@@ -58,6 +58,11 @@ _CACHE_EVENT_TYPES = {
     "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
     "RestoreDoneEvent": Cache.RestoreDoneEvent,
 }
+# make_config's host_write_policy names; ServerArgs validates the flag.
+_HOST_WRITE_POLICIES = {
+    "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
+    "write_back": SchedulerConfig.HostWritePolicy.WriteBack,
+}
 
 
 def engram_context_len(text_config) -> int:
@@ -108,8 +113,10 @@ def make_config(
     role: str,
     *,
     num_snapshot_pages: int,
+    host_group_packing: Sequence[int],
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
+    host_write_policy: str,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -119,6 +126,9 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
+    max_kv_page_num: int = 0,
+    checkpoint_retention_requests: int | None = None,
+    checkpoint_retention_leaf_distance: int | None = None,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -140,11 +150,20 @@ def make_config(
             resident instead of suspending anyone; more enables suspend and
             restore on the fused and decode roles (the prefill role refuses a
             pool).
+        host_group_packing: Virtual children per compact Host parent in
+            scheduler group order; empty when both Host pools are absent.
         max_retracted_requests: Slot-state arena rows, hence the most
             requests suspended at once; positive exactly when a pool exists.
             A victim whose image does not fit the Host (L2 pins, pool, rows)
             is aborted by the scheduler instead of imaged.
         storage_config: Explicit asynchronous L3 budgets, or None without L3.
+        host_write_policy: ``--kvstore-write-policy``: ``"write_through"``
+            streams published entries to Host (at chunk ends, the prompt end
+            and finish); ``"write_back"`` writes back what an admission or a
+            restore evicts, in the same plan (``SchedulerConfig::Validate``
+            refuses it where it cannot run). Required on every role; without a
+            Host tier write_through has no effect, and the decode role's Host
+            tier holds retraction images only.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -159,8 +178,24 @@ def make_config(
         state_checkpoint_in_forward:
             ``--enable-state-checkpoint-in-forward``: the prefill forward that
             spans a long prompt's last prefix-page boundary before its replay
-            tail also writes the State checkpoint there. Requires prefix
-            caching.
+            tail also writes the State checkpoint there, and no KV tail and no
+            State checkpoint is published at a prompt end that checkpoint
+            covers (prefill and fused roles) or at a fused finish past the
+            prompt end. Requires prefix caching.
+        max_kv_page_num: Per-local-prefill-batch budget for the sum of
+            ``ceil((cached prefix + current chunk) / prefix_granularity)``
+            across requests. 0 leaves the budget unbounded. Derived from
+            ``--chunk-prefill-kv-size``.
+        checkpoint_retention_requests: ``--checkpoint-retention-requests``:
+            under cache pressure a hybrid model's State checkpoint that a later
+            request's checkpoint extends ranks as if last used this many new
+            requests ago (0 ranks every cache entry by its own use). None keeps the
+            scheduler's default, 16 times ``max_batch_size``, which is
+            ``--max-num-seqs`` per attention-DP rank.
+        checkpoint_retention_leaf_distance:
+            ``--checkpoint-retention-leaf-distance``: checkpoints within this
+            many later requests of the newest on their branch rank as it does. None keeps the
+            scheduler's default, 0.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -183,11 +218,14 @@ def make_config(
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
+    if max_kv_page_num:
+        cfg.max_kv_page_num = max_kv_page_num
     cfg.max_batch_size = max_batch_size
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
     cfg.num_snapshot_pages = num_snapshot_pages
+    cfg.host_group_packing = list(host_group_packing)
     cfg.max_retracted_requests = max_retracted_requests
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
     cfg.storage_config = storage_config
@@ -205,7 +243,14 @@ def make_config(
         # turning the option on raises AttributeError here instead of being
         # ignored.
         cfg.state_checkpoint_in_forward = True
+    if checkpoint_retention_requests is not None:
+        # Set only when given, as above: an older scheduler wheel keeps its
+        # plain LRU by default and refuses an explicit value.
+        cfg.checkpoint_retention_requests = checkpoint_retention_requests
+    if checkpoint_retention_leaf_distance is not None:
+        cfg.checkpoint_retention_leaf_distance = checkpoint_retention_leaf_distance
     cfg.disable_l2_cache = disable_l2_cache
+    cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
     if cache_groups:
@@ -256,11 +301,12 @@ def resolve_dspark_prefix_replay_tokens(
 ) -> int:
     """Resolve the prompt tail needed to rebuild DSpark runtime state.
 
-    DeepSeek V4 DSpark advertises the requirement through its draft
-    ``ModelConfig``; V4.1 advertises zero because its windows are cache
-    resident. Same-checkpoint DSpark configurations without that capability
-    remain fail-closed. External generic DSpark configurations keep their
-    existing scheduler behavior until they advertise an equivalent contract.
+    A same-checkpoint DSpark draft advertises the requirement through its
+    draft ``ModelConfig``; DeepSeek V4.1 advertises zero because its windows
+    are cache resident. Same-checkpoint DSpark configurations without that
+    capability remain fail-closed. External generic DSpark configurations
+    keep their existing scheduler behavior until they advertise an
+    equivalent contract.
     """
 
     if speculative_algorithm != "DSPARK":
@@ -535,6 +581,12 @@ def packed_block_tables_from_forward_op(
     same-storage check and fall back to one launch per group. The host
     stage is returned too, so a backend planning from the tables reads them
     without a D2H sync.
+
+    Structural contract checks run whenever bounds or expected groups are
+    supplied. Every page ID is scanned against the bounds when they are
+    supplied; at long contexts the scan costs as much as the packing, so
+    callers pass bounds only when they mean to scan
+    (``CacheBatchMetadata.from_forward_op``'s ``validate_page_ids``).
 
     Args:
         forward_op: Scheduler forward operation exporting CPU NumPy tables.

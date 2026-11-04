@@ -32,7 +32,8 @@ use ts_scheduler::RequestSpec;
 use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
 use crate::{
-    request::{LogprobRequest, RequestState, MAX_STOP_TOKEN_IDS},
+    grammar::ReasoningGrammar,
+    request::{LogprobRequest, RequestState, MAX_CACHE_SESSION_ID_BYTES, MAX_STOP_TOKEN_IDS},
     sampling,
 };
 
@@ -43,6 +44,9 @@ pub struct IngressLimits {
     pub vocab_size: i64,
     /// The model's EOS ids, which end every request not ignoring EOS.
     pub eos_token_ids: Vec<i32>,
+    /// The selected sampler's exclusive finite top-k bound; `None` when
+    /// that backend normalizes all positive finite values on admission.
+    pub top_k_exclusive_max: Option<i64>,
     /// The longest request the engine admits, prompt and output.
     pub max_model_len: i64,
     /// The longest prompt.
@@ -56,6 +60,9 @@ pub struct IngressLimits {
     pub multimodal: bool,
     /// Grammar-constrained decoding is on (`--grammar-backend xgrammar`).
     pub grammar: bool,
+    /// How a JSON schema waits for the reasoning block; `None` without a
+    /// grammar, a reasoning parser, or xgrammar's template for it.
+    pub reasoning: Option<ReasoningGrammar>,
     /// Which logprobs beyond the sampled tokens' the engine returns.
     pub logprobs: LogprobServability,
 }
@@ -224,6 +231,12 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     });
     let mut params = request.sampling_params;
     sampling::resolve(&mut params, &rid);
+    if let Some(reasoning) = &limits.reasoning {
+        reasoning.defer_schema(
+            &mut params,
+            request.input_ids.as_deref().unwrap_or_default(),
+        );
+    }
     // Checked as the client sent them: the context clamp below is the
     // engine's, so `min_new_tokens` is bounded by the budget asked for, not
     // the one the context leaves (the request then finishes at its length).
@@ -231,6 +244,17 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         .validation_error
         .clone()
         .or_else(|| embeddings.as_ref().err().cloned())
+        .or_else(|| {
+            request
+                .cache_session_id
+                .as_ref()
+                .filter(|id| id.len() > MAX_CACHE_SESSION_ID_BYTES)
+                .map(|_| {
+                    format!(
+                        "cache_session_id exceeds the limit of {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
+                    )
+                })
+        })
         .or_else(|| refusal(&view, &params, limits));
 
     let prompt_len = request.input_ids.as_ref().map_or(0, Vec::len) as i64;
@@ -240,13 +264,14 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         let own = params.stop_token_ids.iter().flatten().map(|&id| id as i32);
         own.chain(limits.eos_token_ids.iter().copied()).collect()
     };
-    // Clamp the budget to the context (the admitted length limit is one
-    // under the model's).
-    let max_req_len = limits.max_model_len - 1;
+    // Clamp the budget to the usable request length. Input admission
+    // already reserves the first decode/verify window behind the prompt,
+    // so that reserve is not subtracted again here.
+    let max_req_len = limits.max_model_len;
     let max_new_tokens = params
         .max_new_tokens
         .unwrap_or(1 << 30)
-        .min(max_req_len - prompt_len - 1);
+        .min(max_req_len - prompt_len);
     params.max_new_tokens = Some(max_new_tokens);
     let mut state = RequestState::new(
         request.input_ids.clone().unwrap_or_default(),
@@ -257,6 +282,10 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         request.return_logprob,
     );
     state.created_time = request.created_time;
+    state.session_id = request
+        .session_params
+        .as_ref()
+        .and_then(|session| session.id.clone());
 
     if invalid.is_none() && request.return_logprob {
         state.set_logprobs(LogprobRequest {
@@ -302,6 +331,7 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
 
     let spec = RequestSpec {
         request_id: rid.clone(),
+        session_id: request.cache_session_id.unwrap_or_default(),
         tokens: request.input_ids.unwrap_or_default(),
         max_new_tokens: max_new_tokens.clamp(0, i64::from(i32::MAX)) as i32,
         // Prompt logprobs need logits from their start on, so the admission
@@ -514,7 +544,7 @@ fn refusal(
                 .to_owned(),
         );
     }
-    sampling::verify(params, limits.vocab_size).err()
+    sampling::verify_with_top_k_limit(params, limits.vocab_size, limits.top_k_exclusive_max).err()
 }
 
 /// More stop tokens than the sampler's stop table holds.
@@ -548,12 +578,14 @@ mod tests {
         IngressLimits {
             vocab_size: 1000,
             eos_token_ids: vec![2],
+            top_k_exclusive_max: Some(sampling::TOP_K_FUSED_MAX),
             max_model_len: 100,
             max_req_input_len: 90,
             enable_output_logprobs: false,
             requires_bootstrap: false,
             multimodal: false,
             grammar: false,
+            reasoning: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
@@ -596,6 +628,49 @@ mod tests {
     }
 
     #[test]
+    fn finite_top_k_admission_uses_the_selected_sampler_bound() {
+        let backend_normalizes = IngressLimits {
+            top_k_exclusive_max: None,
+            ..limits()
+        };
+        for top_k in [1, 127, 128, 4095, 4096, 4097, 163840, 1_i64 << 40, -1] {
+            let params = SamplingParams {
+                temperature: 1.0,
+                top_k,
+                ..Default::default()
+            };
+            let Some(Admitted::Run(admission)) =
+                admit(request("npu", vec![1], params.clone()), &backend_normalizes)
+            else {
+                panic!("backend must receive top_k={top_k}");
+            };
+            // Only the selected sampling backend clamps its device pool.
+            assert_eq!(
+                admission.sampling_params.top_k,
+                if top_k == -1 {
+                    sampling::TOP_K_DISABLED
+                } else {
+                    top_k
+                }
+            );
+            let gpu = admit(request("gpu", vec![1], params), &limits()).unwrap();
+            if top_k != -1 && top_k >= sampling::TOP_K_FUSED_MAX {
+                assert!(refused_message(gpu).contains("top_k must be < 128"));
+            } else {
+                assert!(matches!(gpu, Admitted::Run(_)));
+            }
+        }
+        for top_k in [0, -2] {
+            let params = SamplingParams {
+                top_k,
+                ..Default::default()
+            };
+            let refusal = admit(request("invalid", vec![1], params), &backend_normalizes).unwrap();
+            assert!(refused_message(refusal).contains("top_k must be -1 (disable), or at least 1"));
+        }
+    }
+
+    #[test]
     fn an_admitted_request_has_its_budget_and_stop_tokens() {
         let params = SamplingParams {
             max_new_tokens: Some(8),
@@ -614,20 +689,63 @@ mod tests {
     }
 
     #[test]
+    fn cache_session_ids_preserve_bounded_tags_and_refuse_oversized_tags() {
+        for session_id in [
+            None,
+            Some(String::new()),
+            Some("s".repeat(4095)),
+            Some("s".repeat(4096)),
+            Some("🦀".repeat(1024)),
+        ] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_session_id = session_id.clone();
+            let Some(Admitted::Run(admission)) = admit(request, &limits()) else {
+                panic!("expected admission for a bounded session id");
+            };
+            assert_eq!(admission.spec.session_id, session_id.unwrap_or_default());
+            assert_eq!(admission.spec.tokens, [1, 2, 3]);
+        }
+        for session_id in ["s".repeat(4097), format!("{}s", "🦀".repeat(1024))] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_session_id = Some(session_id);
+            let message = refused_message(admit(request, &limits()).unwrap());
+            assert!(message.contains("cache_session_id"), "{message}");
+            assert!(message.contains("4096 UTF-8 bytes"), "{message}");
+        }
+    }
+
+    #[test]
     fn the_budget_is_clamped_to_the_context() {
-        let Some(Admitted::Run(admission)) = admit(
-            request("r1", vec![0; 50], SamplingParams::default()),
-            &limits(),
-        ) else {
-            panic!("expected admission");
+        let limits = IngressLimits {
+            max_req_input_len: 99,
+            ..limits()
         };
-        // max_model_len - 1 - prompt - 1
-        assert_eq!(admission.spec.max_new_tokens, 48);
+        for (prompt_len, requested, expected) in [
+            (50, None, 50),
+            (99, Some(1), 1),
+            (99, None, 1),
+            (99, Some(0), 0),
+        ] {
+            let params = SamplingParams {
+                max_new_tokens: requested,
+                ..Default::default()
+            };
+            let Some(Admitted::Run(admission)) =
+                admit(request("r1", vec![0; prompt_len], params), &limits)
+            else {
+                panic!("expected admission");
+            };
+            assert_eq!(admission.spec.max_new_tokens, expected);
+            assert_eq!(
+                admission.sampling_params.max_new_tokens,
+                Some(i64::from(expected))
+            );
+        }
     }
 
     #[test]
     fn min_new_tokens_is_checked_against_the_budget_asked_for() {
-        // The context leaves 8 tokens of the 50 asked for: the request runs
+        // The context leaves 10 tokens of the 50 asked for: the request runs
         // to its length rather than being refused over a budget the client
         // never sent.
         let params = SamplingParams {
@@ -639,8 +757,8 @@ mod tests {
         else {
             panic!("expected admission");
         };
-        assert_eq!(admission.spec.max_new_tokens, 8);
-        assert_eq!(admission.sampling_params.max_new_tokens, Some(8));
+        assert_eq!(admission.spec.max_new_tokens, 10);
+        assert_eq!(admission.sampling_params.max_new_tokens, Some(10));
 
         let params = SamplingParams {
             max_new_tokens: Some(10),
@@ -723,6 +841,82 @@ mod tests {
         assert!(
             message.contains("21 stop token ids") && message.contains("at most 15"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn a_json_schema_waits_for_the_reasoning_block() {
+        let reasoning = ReasoningGrammar {
+            continues: r#"{"continues":SLOT}"#.to_owned(),
+            may_open: r#"{"may_open":SLOT}"#.to_owned(),
+            schema_slot: "SLOT".to_owned(),
+            markers: Some((7, 8)),
+        };
+        let admitted = |limits: &IngressLimits, prompt: Vec<i32>, schema: &str| {
+            let params = SamplingParams {
+                json_schema: Some(schema.to_owned()),
+                ..Default::default()
+            };
+            let Some(Admitted::Run(admission)) = admit(request("r", prompt, params), limits) else {
+                panic!("expected admission");
+            };
+            admission
+        };
+        let limits = IngressLimits {
+            grammar: true,
+            reasoning: Some(reasoning.clone()),
+            ..limits()
+        };
+        let schema = r#"{"type":"object"}"#;
+
+        // The prompt ends inside the block: the reply continues it.
+        let opened = admitted(&limits, vec![1, 7, 3], schema);
+        assert_eq!(opened.sampling_params.json_schema, None);
+        assert_eq!(
+            opened.sampling_params.structural_tag.as_deref(),
+            Some(r#"{"continues":{"type":"object"}}"#)
+        );
+        assert_eq!(opened.grammar.map(|key| key.kind), Some("structural_tag"));
+        // A block the prompt closed, or never opened: the reply may open one.
+        for prompt in [vec![1, 7, 8, 3], vec![1, 2]] {
+            assert_eq!(
+                admitted(&limits, prompt, schema)
+                    .sampling_params
+                    .structural_tag
+                    .as_deref(),
+                Some(r#"{"may_open":{"type":"object"}}"#)
+            );
+        }
+        // Without single-token markers every prompt counts as opening it.
+        let unmarked = IngressLimits {
+            reasoning: Some(ReasoningGrammar {
+                markers: None,
+                ..reasoning
+            }),
+            ..limits.clone()
+        };
+        assert_eq!(
+            admitted(&unmarked, vec![1, 2], schema)
+                .sampling_params
+                .structural_tag
+                .as_deref(),
+            Some(r#"{"continues":{"type":"object"}}"#)
+        );
+        // A schema that is not JSON stays, for the compiler to refuse.
+        let any = admitted(&limits, vec![1, 7], "$$ANY$$");
+        assert_eq!(any.sampling_params.json_schema.as_deref(), Some("$$ANY$$"));
+        assert_eq!(any.sampling_params.structural_tag, None);
+        // Without a reasoning parser the schema constrains the whole reply.
+        let plain = IngressLimits {
+            reasoning: None,
+            ..limits.clone()
+        };
+        assert_eq!(
+            admitted(&plain, vec![1, 7], schema)
+                .sampling_params
+                .json_schema
+                .as_deref(),
+            Some(schema)
         );
     }
 

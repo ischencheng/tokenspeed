@@ -14,9 +14,9 @@ from tokenspeed.runtime.configs.model_config import (
     is_multimodal_model,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.mlp import GatedMLP
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 from tokenspeed.runtime.models.minimax_m3 import (
-    MiniMaxM3MLP,
     MiniMaxM3SparseForConditionalGeneration,
     MiniMaxM3SparseMoeBlock,
 )
@@ -153,7 +153,6 @@ def test_minimax_m3_attention_family_selects_msa() -> None:
     spec = _resolve_attention_family(config, config.text_config)
     assert spec is not None
     assert spec.name == "MiniMax MSA"
-    assert spec.default_prefix_granularity == 128
     # --attention-backend must keep selecting the dense sub-backend; the
     # top-level backend is pinned by MSAConfig itself.
     assert spec.default_backend is None
@@ -237,7 +236,7 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
     )
     model = _build_model(monkeypatch, quant_config=_mxfp8_config())
 
-    assert isinstance(model.model.layers[0].mlp, MiniMaxM3MLP)
+    assert isinstance(model.model.layers[0].mlp, GatedMLP)
     assert isinstance(model.model.layers[3].mlp, MiniMaxM3SparseMoeBlock)
     experts = model.model.layers[3].mlp.experts
     assert experts.w13_weight.shape == (8, 64, 128)

@@ -5,7 +5,7 @@ operation: optional per-head QK RMSNorm, RoPE (full, partial, or multimodal),
 quantization, and the KV cache write. Models describe which steps apply to a
 `PagedAttention` layer. They never apply its per-head norm, rotate, quantize, or
 write its new K/V rows themselves. An MLA model still normalizes its latent
-and projects its absorbed query before the prologue. DeepSeek-V4 and V4.1
+and projects its absorbed query before the prologue. DeepSeek V4.1
 attention is not a `PagedAttention` layer and keeps its own fused steps over
 its own cache groups.
 
@@ -322,35 +322,46 @@ behavioral trait (`has_norm`, `mrope`, `return_kv`, `expanded`, and the rest)
 the kernel does not implement for every value. An `override` naming a kernel
 this platform cannot run, or whose traits exclude the request, raises.
 
-## Ascend native DSA model components
+## Ascend integration
 
-`tokenspeed.runtime.layers.attention.dsa.ascend` owns `AscendDSAAttention`,
-`AscendDSAIndexer`, prepared `FusedDSADecode` and bit-preserving projection
-weight layouts. Models supply their configuration, projection dimensions and
-explicit independent-selection/separate-projection choices. The shared module
-has no dependency on model extensions.
+Shared Ascend DSA and MLA components own attention execution. Models supply
+configuration and checkpoint weights; kernel selection and weight preparation
+belong to the `attention` family in `tokenspeed-kernel`. Weight preparation
+preserves coefficients and dtype.
 
-The native decode ABI currently supports DCP8, draft8, hidden width 4096,
-64 global index heads and eight local attention heads. Its supported gathered
-row counts are 64/128/256/512. The prepared prologue owns normalization,
-optional independent MLA/indexer RoPE and BF16 cache writes;
-the existing paged backend owns sparse selection and attention. Unsupported
-execution shapes fail instead of selecting another projection path.
+DSA's indexer uses the normalized Q latent before the main attention's Q-LoRA
+scale. Prefill applies that scale after the main Q projection;
+the fused Decode packs it into only the main Q projection panels. The shared
+Q norm and indexer projection remain unscaled. Indexer head weights retain FP32
+and include `index_head_dim**-0.5 * index_n_heads**-0.5` in every execution path.
+Moving the main scale into the shared norm changes the indexer scores. Packed
+BF16 weight scaling can round differently from activation scaling; this does
+not establish cross-provider bitwise equality.
 
-The paged backend also accepts the ordinary MLA/indexer projections. A model
-adapter can use them for prefill or capture buckets outside the native shape
-contract while retaining fused decode for supported rows. Both use the same
-causal metadata and cache placement; only the projection and collective provider
-differs.
+Native prologues follow the normalization, rotation and cache-write contracts
+above. Owner-sharded transport may commit prepared KV rows on the prologue's
+behalf; router-provided slots, ownership masks and cache sanitization remain
+authoritative. Distributed execution preserves each request's causal visibility.
 
-When a model already owns a SHMEM runtime, attach a separate DSA window to that
-owner before capture instead of initializing another runtime. The model keeps
-the attached window and registered attention outputs alive until its graphs are
-released, closes imported IPC mappings before freeing their exports, then releases
-the DSA window before the owning communication runtime.
-The model adapter supplies these prepared resources through the installed
-provider; the common runtime does not create a second resource manager.
+DSA Prefill uses token-local queries with all heads, gathers KV and Indexer-K,
+and returns complete output rows without Q/TopK/output/LSE exchanges. MLA
+Prefill keeps its head partition: it gathers normalized Q latents, projects
+local heads, consumes gathered KV history and current rows, and retains the
+existing output reduction. Indexer-K and KV share one BF16 transport packet
+per phase; gathering and cache commit preserve their bits.
 
-Device projection format conversion stays behind the kernel-package adapter.
-Preparing a weight allocates fresh NZ29 storage without changing coefficients
-or dtype; graph execution consumes the prepared buffers and communication state.
+The preceding KDA segment may submit history gathering. The attention entry
+ensures it if absent. Receive and packet tensors are temporary and follow actual
+batch page geometry; fixed gather workspaces are not part of the model cache.
+All user-managed Prefill work uses one execution stream and synchronous HCCL
+interfaces. Tensor references and allocator stream tracking cover every queued
+consumer. Weight preparation and Decode graph behavior remain unchanged.
+These byte-preserving gathers do not establish cross-provider bitwise equality
+for attention arithmetic or reductions.
+
+Prefill KV transport borrows an isolated accelerator process group from the
+runtime process-group manager. All world ranks create the cache-owner groups
+in the same order when publishing the cache pool, before any forward or
+decode graph capture. A forward never creates a process group; an idle DP
+rank still participates in startup. Temporary tensor ownership ends after
+the final consumer, while the process-group manager retains the communicator.

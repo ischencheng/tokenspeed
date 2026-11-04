@@ -324,6 +324,7 @@ def test_the_boot_floor_reads_both_knobs(
     ceiling, capture_batch_sizes, context, rows_per_request, max_num_seqs, expected
 ) -> None:
     server_args = SimpleNamespace(
+        disaggregation_mode="null",
         all2all_backend="none",
         prefill_graph_max_tokens=ceiling,
         chunked_prefill_size=8192,
@@ -431,6 +432,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
     monkeypatch.setattr(device, "_rebind_under_reserve", rebind)
     server_args = SimpleNamespace(
         disaggregation_mode="null",
+        enable_external_encoder=False,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
@@ -546,7 +548,7 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         (
             "layers/attention/registry.py",
             "create_attn_components",
-            "prepare_cache_setup",
+            "cache_recipe",
         ),
         (
             "layers/attention/kv_cache/recipes/setup.py",

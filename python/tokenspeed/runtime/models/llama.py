@@ -37,12 +37,8 @@ from transformers import LlamaConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from tokenspeed.runtime.layers.linear import QKVParallelLinear, RowParallelLinear
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -56,58 +52,6 @@ from tokenspeed.runtime.models.utils import (
     validate_attention_partition,
 )
 from tokenspeed.runtime.utils import add_prefix
-
-
-class LlamaMLP(nn.Module):
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        tp_rank = mapping.dense.tp_rank
-        tp_size = mapping.dense.tp_size
-        tp_group = mapping.dense.tp_group
-
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=False,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[0] == 0:
-            return x
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 class LlamaAttention(nn.Module):
@@ -206,7 +150,7 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         # Skip the QKV projection, RoPE, attention, and o_proj kernels when
         # the batch row is empty (e.g. idle ranks under DP attention). Matches
-        # the short-circuit ``LlamaMLP.forward`` already has.
+        # the short-circuit ``GatedMLP.forward`` already has.
         if hidden_states.shape[0] == 0:
             return hidden_states.new_zeros(
                 (0, self.hidden_size), dtype=hidden_states.dtype
@@ -245,11 +189,15 @@ class LlamaDecoderLayer(BaseDecoderLayer):
         )
 
     def resolve_mlp(self, prefix: str) -> nn.Module:
-        return LlamaMLP(
+        return GatedMLP.tensor_parallel(
             hidden_size=self.config.hidden_size,
             intermediate_size=self.config.intermediate_size,
-            hidden_act=self.config.hidden_act,
-            mapping=self.mapping,
+            activation=gated_activation(self.config.hidden_act, swiglu_limit=None),
+            tp_rank=self.mapping.dense.tp_rank,
+            tp_size=self.mapping.dense.tp_size,
+            tp_group=self.mapping.dense.tp_group,
+            reduce_results=False,
+            fusions=(),
             quant_config=self.quant_config,
             prefix=add_prefix("mlp", prefix),
         )
@@ -261,25 +209,7 @@ class LlamaModel(BaseTransformerModel):
 
 class LlamaForCausalLM(BaseCausalLM):
     model_cls = LlamaModel
-
-    # BitsAndBytes target/stacked modules — kept in sync with the Qwen3 / MoE
-    # variants so a single quantization config works across the Llama family.
-    default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+    supports_aux_capture = True
 
     def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
         return [

@@ -147,32 +147,6 @@ def _reject_skip_term(D: torch.Tensor | None) -> None:
         raise ValueError("the GDN/KDA recurrence has no D skip term")
 
 
-def _prepare_gdn_decode_state_path(
-    ssm_states: torch.Tensor,
-    initial_state_indices: torch.Tensor,
-    output_state_indices: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor | None, str | None]:
-    """Select a safe decode solution while preserving graph padding indices.
-
-    FlashInfer's FP32 kernels skip negative state rows, and the portable Triton
-    kernels guard negative reads and writes for both FP32 and BF16 state. The
-    FlashInfer BF16 path instead redirects padding to row 0 — the arena's
-    reserved null page, which must stay zero for every fresh-state read.
-    Until that kernel supports a padding mask, route BF16 state through
-    Triton and keep ``-1`` unchanged.
-    """
-    return (
-        initial_state_indices,
-        output_state_indices,
-        gdn_decode_solution(ssm_states.dtype),
-    )
-
-
-def gdn_decode_solution(ssm_dtype: torch.dtype) -> str | None:
-    """The GDN decode/verify solution forced for a state dtype (see above)."""
-    return "triton" if ssm_dtype == torch.bfloat16 else None
-
-
 def _build_cu_extend_seq_lens_cpu(
     extend_seq_lens_cpu: torch.Tensor, expected_len: int
 ) -> torch.Tensor:
@@ -237,7 +211,9 @@ class MambaForwardMetadata:
     state_out_blocks_by_group: dict[str, torch.Tensor] | None = None
     # The in-forward State checkpoints this extend forward writes, and the
     # chunked scan's plan for them (its interval, buffer and the buffer row of
-    # each checkpoint); None when the forward writes none.
+    # each checkpoint); None when the forward writes none. A MIXED forward
+    # that runs its decode rows apart writes them through its extend rows'
+    # metadata alone (_prepare_mixed_verify_metadata).
     state_checkpoints: InForwardStateCheckpoints | None = None
     scan_state_checkpoints: GdnStateCheckpoints | None = None
     scan_checkpoint_rows: torch.Tensor | None = None
@@ -1118,6 +1094,11 @@ class MambaAttnBackend(AttentionBackend):
             extend_seq_lens_cpu, query_start_loc.numel()
         )
 
+        # A MIXED forward whose decode rows defer their state commit runs them
+        # apart from its leading extend rows (_prepare_mixed_verify_metadata).
+        split_mixed = (
+            forward_mode.is_mixed() and self.deferred_state_commit and num_extends < bs
+        )
         state_in_blocks_by_group = None
         state_out_blocks_by_group = None
         state_checkpoints = None
@@ -1143,13 +1124,19 @@ class MambaAttnBackend(AttentionBackend):
                 block_tables,
                 self._state_group_ids,
             )
-        if state_checkpoints is not None:
-            if not self._stores_in_forward_state_checkpoints:
-                raise RuntimeError(
-                    f"{type(self).__name__} cannot store in-forward State checkpoints"
-                )
+        if (
+            state_checkpoints is not None
+            and not self._stores_in_forward_state_checkpoints
+        ):
+            raise RuntimeError(
+                f"{type(self).__name__} cannot store in-forward State checkpoints"
+            )
+        # A split MIXED forward never scans the whole batch: its extend rows'
+        # metadata carries the checkpoints and plans them over those rows.
+        batch_checkpoints = None if split_mixed else state_checkpoints
+        if batch_checkpoints is not None:
             scan_state_checkpoints, scan_checkpoint_rows = self._scan_state_checkpoints(
-                state_checkpoints, extend_seq_lens_cpu
+                batch_checkpoints, extend_seq_lens_cpu
             )
 
         self.forward_metadata = MambaForwardMetadata(
@@ -1163,14 +1150,19 @@ class MambaAttnBackend(AttentionBackend):
             ),
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
-            state_checkpoints=state_checkpoints,
+            state_checkpoints=batch_checkpoints,
             scan_state_checkpoints=scan_state_checkpoints,
             scan_checkpoint_rows=scan_checkpoint_rows,
         )
 
-        if forward_mode.is_mixed() and self.deferred_state_commit and num_extends < bs:
+        if split_mixed:
             self._prepare_mixed_verify_metadata(
-                bs, num_extends, req_pool_indices, seq_lens, block_tables
+                bs,
+                num_extends,
+                req_pool_indices,
+                seq_lens,
+                block_tables,
+                state_checkpoints=state_checkpoints,
             )
 
     def _scan_state_checkpoints(
@@ -1185,7 +1177,9 @@ class MambaAttnBackend(AttentionBackend):
 
         Args:
             checkpoints: This forward's checkpoints.
-            scan_seq_lens_cpu: Host ``[bs]`` tokens of each scanned sequence.
+            scan_seq_lens_cpu: Host tokens of each sequence the scan covers,
+                in batch-row order: every row, or only the leading extend
+                rows when a MIXED forward runs its decode rows apart.
 
         Returns:
             ``(scan checkpoints, device int64 buffer row of each checkpoint)``.
@@ -1215,11 +1209,23 @@ class MambaAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         block_tables: Mapping[str, torch.Tensor],
+        *,
+        state_checkpoints: InForwardStateCheckpoints | None,
     ) -> None:
-        """Reuse ordinary prefill and decode metadata for their respective rows."""
+        """Reuse ordinary prefill and decode metadata for their respective rows.
+
+        ``state_checkpoints`` are the forward's in-forward State checkpoints
+        (all on extend rows), or None; the prefill rows' scan stores them.
+        """
         full_metadata = self.forward_metadata
         lengths = full_metadata.extend_seq_lens_cpu[:num_extends]
         boundaries = full_metadata.query_start_loc[: num_extends + 1]
+        scan_state_checkpoints = None
+        scan_checkpoint_rows = None
+        if state_checkpoints is not None:
+            scan_state_checkpoints, scan_checkpoint_rows = self._scan_state_checkpoints(
+                state_checkpoints, lengths
+            )
         prefill = MambaForwardMetadata(
             query_start_loc=boundaries,
             scan_query_start_loc=full_metadata.scan_query_start_loc[: num_extends + 1],
@@ -1245,6 +1251,11 @@ class MambaAttnBackend(AttentionBackend):
                 group: pages[:num_extends]
                 for group, pages in full_metadata.state_out_blocks_by_group.items()
             },
+            # The extend rows lead the packed input, so the checkpoints' token
+            # indices address these rows as they are.
+            state_checkpoints=state_checkpoints,
+            scan_state_checkpoints=scan_state_checkpoints,
+            scan_checkpoint_rows=scan_checkpoint_rows,
         )
         decode_bs = bs - num_extends
         self.refresh_decode_metadata(
@@ -1853,15 +1864,6 @@ class MambaAttnBackend(AttentionBackend):
             ``[1, B, Hv, V]`` layer output.
         """
         _reject_skip_term(D)
-        (
-            decode_initial_indices,
-            decode_output_indices,
-            decode_solution,
-        ) = _prepare_gdn_decode_state_path(
-            ssm_states,
-            read_indices,
-            write_indices,
-        )
         core_attn_out = gdn_decode_step(
             q=query,
             k=key,
@@ -1871,11 +1873,10 @@ class MambaAttnBackend(AttentionBackend):
             dt_bias=dt_bias,
             b=b.unsqueeze(1),
             initial_state=ssm_states,
-            initial_state_indices=decode_initial_indices,
+            initial_state_indices=read_indices,
             # Write to the out page, not the possibly shared input page.
-            output_state_indices=decode_output_indices,
+            output_state_indices=write_indices,
             use_qk_l2norm=True,
-            solution=decode_solution,
         )
         # [B, 1, Hv, V] (pool/indices-major) -> [1, B, Hv, V], this backend's
         # decode-output convention (matches gdn_chunk_prefill's B=1-leading out).
@@ -2456,15 +2457,6 @@ class MambaAttnBackend(AttentionBackend):
                 batch_size, draft_token_num
             )
             output_state_indices = output_indices
-        (
-            mtp_initial_indices,
-            mtp_output_indices,
-            mtp_solution,
-        ) = _prepare_gdn_decode_state_path(
-            initial_state,
-            initial_indices,
-            output_state_indices,
-        )
         return gdn_decode_mtp(
             query_b,
             key_b,
@@ -2474,9 +2466,9 @@ class MambaAttnBackend(AttentionBackend):
             dt_bias=dt_bias,
             b=b_b,
             initial_state=initial_state,
-            initial_state_indices=mtp_initial_indices,
+            initial_state_indices=initial_indices,
             use_qk_l2norm=True,
-            output_state_indices=mtp_output_indices,
+            output_state_indices=output_state_indices,
             output_state=output_state,
             intermediate_states_buffer=intermediate_states,
             tree_ancestors=self._verify_ancestors(
@@ -2484,7 +2476,6 @@ class MambaAttnBackend(AttentionBackend):
             ),
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
-            solution=mtp_solution,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     def _prefill_scan(

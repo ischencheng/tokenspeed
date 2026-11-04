@@ -27,13 +27,10 @@ import logging
 
 import torch
 from tokenspeed_kernel.ops.gemm import (
-    dsv4_grouped_output_projection_preprocessor as kernel_dsv4_grouped_output_projection_preprocessor,
-)
-from tokenspeed_kernel.ops.gemm import (
     mm,
+    prepare_mxfp8_weight_scales,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.weights import get_weight_broker
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.parameter import (
@@ -109,6 +106,9 @@ class Fp8LinearMethod(LinearMethodBase):
         # unquantized.
         self.dequantized = False
         self._unquantized = None
+        # 1x32 weight scales in the native GEMM's layout, or None for the
+        # original path. see prepare_weight_scales.
+        self.prepared_weight_scales: torch.Tensor | None = None
 
     def create_weights(
         self,
@@ -241,27 +241,12 @@ class Fp8LinearMethod(LinearMethodBase):
                     "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
                 )
                 layer.input_scale = None
-            grouped_output_projection_plan = getattr(
-                layer, "_dsv4_grouped_output_projection_plan", None
-            )
             if (
-                grouped_output_projection_plan is None
-                and tuple(self.quant_config.weight_block_size) == (1, 32)
+                tuple(self.quant_config.weight_block_size) == (1, 32)
                 and layer.weight_scale_inv.dtype == torch.uint8
                 and mxfp8_linears_load_as_bf16()
             ):
                 self._dequantize_at_load(layer)
-                return
-            if grouped_output_projection_plan is not None:
-                preprocessor = kernel_dsv4_grouped_output_projection_preprocessor(
-                    grouped_output_projection_plan
-                )
-                broker = get_weight_broker()
-                if preprocessor is None:
-                    broker.enroll(layer.weight, None)
-                    broker.enroll(layer.weight_scale_inv, None)
-                else:
-                    broker.preprocess(preprocessor, layer)
                 return
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
@@ -339,6 +324,33 @@ class Fp8LinearMethod(LinearMethodBase):
         self._unquantized.process_weights_after_loading(layer)
         self.dequantized = True
 
+    @torch.no_grad()
+    def prepare_weight_scales(self, layer: torch.nn.Module) -> None:
+        """Derive this layer's prepacked 1x32 weight scales from the loaded ones.
+
+        The original path swizzles the weight scales inside every forward,
+        preparing them once removes that. A model opts in by calling this once
+        its loaded weights are final (``post_load_weights`` and
+        ``post_quant_warmup``), which also covers live weight updates: the first
+        call keeps the result, and later calls copy into that buffer, so
+        captured CUDA graphs keep reading the same address.
+        """
+        if (
+            not self.block_quant
+            or list(self.quant_config.weight_block_size) != [1, 32]
+            or layer.weight.dtype != torch.float8_e4m3fn
+            or layer.weight_scale_inv.dtype != torch.uint8
+        ):
+            return
+        prepared = prepare_mxfp8_weight_scales(layer.weight, layer.weight_scale_inv)
+        cached = self.prepared_weight_scales
+        if cached is None:
+            self.prepared_weight_scales = prepared
+            return
+        if prepared is None or prepared.shape != cached.shape:
+            raise ValueError("prepacked MXFP8 weight scales changed layout")
+        cached.copy_(prepared)
+
     def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
         if self.dequantized:
             output = self.apply(layer, x, bias, block_scale, output_dtype)
@@ -365,6 +377,24 @@ class Fp8LinearMethod(LinearMethodBase):
         input_2d = x.view(-1, x.shape[-1])
         output_shape = [*x.shape[:-1], layer.weight.shape[0]]
         output_dtype = output_dtype or x.dtype
+        if self.prepared_weight_scales is not None and (
+            block_scale is not None or x.dtype in (torch.bfloat16, torch.float16)
+        ):
+            # Quantizes 16-bit activations straight into the native GEMM's
+            # scale layout. E4M3 codes keep their original scales.
+            output = mm(
+                input_2d,
+                layer.weight,
+                A_scales=block_scale,
+                B_scales=self.prepared_weight_scales,
+                bias=bias,
+                out_dtype=output_dtype,
+                quant="mxfp8",
+                block_size=[1, 32],
+                prepacked_scales=True,
+                out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
+            )
+            return out if out is not None else output.view(*output_shape)
         if block_scale is None:
             scale_encoding = (
                 "ue8m0" if layer.weight_scale_inv.dtype == torch.uint8 else "float32"
@@ -463,3 +493,17 @@ class Fp8LinearMethod(LinearMethodBase):
     def static_fp8_input_scale(self, layer: torch.nn.Module) -> torch.Tensor | None:
         # Block and dynamic activation scales are found per call, so no producer can apply them.
         return None if self.block_quant else layer.input_scale
+
+
+def prepare_fp8_linear_weight_scales(model: torch.nn.Module) -> None:
+    """Prepare or refresh the prepacked weight scales of a model's FP8 linears.
+
+    For a model's ``post_load_weights`` and ``post_quant_warmup``; see
+    ``Fp8LinearMethod.prepare_weight_scales``.
+    """
+    for module in model.modules():
+        # Linear and embedding layers hold a quant_method; the startup loader's
+        # post-load step finds them the same way.
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, Fp8LinearMethod):
+            quant_method.prepare_weight_scales(module)

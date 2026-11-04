@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -43,6 +44,15 @@ namespace tokenspeed {
 // ranks the kinds: a block republished at a later point keeps the higher one.
 enum class CacheBoundaryKind { kChunk, kEndpoint };
 
+// The tiers a prefix cache entry lives on: Device L1 and Host L2.
+enum class CacheTier { kDevice, kHost };
+
+// The most new-request admissions an aged State checkpoint may rank behind
+// (SchedulerConfig::checkpoint_retention_requests).
+inline constexpr std::int64_t kMaxCheckpointRetentionRequests{std::int64_t{1} << 20};
+// Checkpoint distances from here on rank alike (CheckpointTree).
+inline constexpr std::int32_t kMaxCheckpointDistance{5};
+
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
 
@@ -61,7 +71,10 @@ struct CacheKey {
 };
 
 struct CacheKeyHash {
-    std::size_t operator()(const CacheKey& key) const noexcept {
+    // Hashing the content digest is not a cheap integer operation. Without
+    // noexcept, libstdc++ retains each node's hash instead of recomputing it
+    // while traversing a bucket or erasing an entry.
+    std::size_t operator()(const CacheKey& key) const {
         std::size_t hash = std::hash<CacheNamespaceId>{}(key.namespace_id);
         const std::size_t group_hash = std::hash<std::uint32_t>{}(key.group_id);
         hash ^= group_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
@@ -71,6 +84,12 @@ struct CacheKeyHash {
         return hash ^ (offset_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U));
     }
 };
+
+// Immutable keys expanded for one prompt and one coordinator's group geometry.
+// These carry no residency or ownership information; every retry still probes
+// the current cache indexes. Sharing keeps a pending probe valid when its
+// request drops the prepared keys after successful admission.
+using PreparedPrefixKeys = std::shared_ptr<const std::vector<std::vector<CacheKey>>>;
 
 struct CacheGroupSpec {
     AttnKind attn_kind{AttnKind::kFull};
@@ -91,6 +110,10 @@ struct CacheGroupSpec {
     std::int32_t block_granularity{0};
     // Cyclic owners of the virtual blocks; must divide cache_blocks_per_lcm_block.
     std::int32_t shard_count{1};
+    // State checkpoints may only be reused/published at multiples of this
+    // token count and must be produced by prefill. 1 preserves arbitrary
+    // natural checkpoints, including decode endpoints. No row span.
+    std::int32_t checkpoint_granularity{1};
 };
 
 // How a group's table grows in one admission. The two shapes use different
@@ -175,6 +198,24 @@ struct TailPublication {
     ContentHash hash{};
 };
 
+// What the owner of a published partial page does with its blocks of that
+// page after the publication.
+enum class OwnerTail {
+    // The frontier is final (finish, retraction): the blocks are published in
+    // place.
+    kFinal,
+    // The owner keeps writing past the point (a prompt end followed by
+    // decode): its blocks are registered without taking another request's
+    // canonical block into the table, and the admission moves off every one
+    // it registered into the copy-in block the request holds for its slot,
+    // copying the published bytes into it.
+    kCopiedIn,
+    // The owner keeps writing past a point whose KV is cached already (a
+    // chunk end cut at a junction): its blocks stay unpublished, and only the
+    // State groups publish, under the tail's hash.
+    kKept,
+};
+
 // What a request completed since the coordinator last saw it, ready to
 // publish. prefix_hashes is the request's cumulative completed prefix-page
 // history; the pages from first_new_prefix_page on are the new ones. The
@@ -182,18 +223,17 @@ struct TailPublication {
 // range, a tail, or a state checkpoint. The request owns the storage behind
 // the spans.
 struct CompletedPages {
+    // The completed tokens, which order checkpoints inside a page.
+    std::span<const std::int32_t> tokens{};
     std::span<const std::string> prefix_hashes{};
     std::int32_t first_new_prefix_page{0};
     // The partial page at this publication point, absent when the point is
     // page-aligned (T = prefix_hashes.size() * P).
     std::optional<TailPublication> tail{};
-    // The owner keeps writing the partial page after this publication (a
-    // prompt end followed by decode, a junction-cut chunk end): the admission
-    // swaps a fresh block into the table slot and copies the published bytes
-    // into it. False at finish and retraction, where the block is final and
-    // is published in place. Only an admission may set it: the copy needs the
-    // transaction's capacity.
-    bool owner_continues{false};
+    // What the owner does with its blocks of the tail. Only an admission may
+    // publish anything but kFinal: the copy-in spends blocks the request
+    // holds (CacheCoordinator::Admit).
+    OwnerTail owner_tail{OwnerTail::kFinal};
     // This point is a natural checkpoint of the recurrent state (prompt end,
     // finish, retraction, a junction-cut chunk end): every State group
     // publishes slot 1 -- the block the forward that ended here wrote --
@@ -203,7 +243,9 @@ struct CompletedPages {
     // An in-forward State checkpoint an earlier forward wrote at the page
     // boundary prefix_hashes[state_checkpoint_pages - 1]: every State group
     // publishes its block from state_checkpoint_blocks (indexed by group, null
-    // elsewhere) under that page's chain hash. Zero pages means none.
+    // elsewhere) under that page's chain hash, and a sliding window published
+    // behind that boundary is an endpoint's regardless of boundary_kind. Zero
+    // pages means none.
     std::int32_t state_checkpoint_pages{0};
     std::span<CacheBlockRef> state_checkpoint_blocks{};
     // Which kind of boundary the publication ends on (eviction provenance).
@@ -269,6 +311,23 @@ struct BlockTransfer {
 struct HostPublication {
     CacheKey key;
     CacheBlockRef block;
+};
+
+// The lifetime of one asynchronous store op: the transfer manager's record of
+// the op holds the only owning reference, from the op's start to its ACK.
+struct StoreInFlight {};
+
+// One store op a waiter needs landed -- a retraction image waits for the
+// stores that copy or publish its Host slots, an eviction write-back segment
+// for those that carry its members. The id routes the op's publications to
+// the waiter; whether the op landed is read off the weak reference, which
+// expires with the op's record at the ACK, so no ACK has to find and update
+// its waiters.
+struct StoreWait {
+    std::uint32_t op_id{0};
+    std::weak_ptr<const StoreInFlight> in_flight;
+
+    bool Landed() const { return in_flight.expired(); }
 };
 
 // One imaged block of a retracted request's table: the logical slot it sat

@@ -82,18 +82,26 @@ def _reference(
 
 
 @pytest.mark.parametrize(
-    "width,accepted",
+    "batch,width,accepted",
     [
-        (width, accepted)
+        (8 if width == 16 else 4, width, accepted)
         for width in (1, 2, 3, 4, 8, 16)
         for accepted in range(width + 1)
+    ]
+    # Above eight requests verify widens its value tile for windows below eight.
+    + [
+        (16, width, accepted)
+        for width in (4, 8, 16)
+        for accepted in (0, width // 2, width)
     ],
 )
 @pytest.mark.parametrize("dim", [64, 128])
-def test_vllm_recoverssm_verify_and_commit(width: int, accepted: int, dim: int) -> None:
+def test_vllm_recoverssm_verify_and_commit(
+    batch: int, width: int, accepted: int, dim: int
+) -> None:
     torch.manual_seed(7331)
     device = "cuda"
-    batch, heads = (8 if width == 16 else 4, 12)
+    heads = 12
     q = torch.randn(batch, width, heads, dim, device=device).bfloat16()
     k = torch.randn_like(q)
     v = torch.randn_like(q).mul_(0.2)
@@ -512,6 +520,7 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(
             record_metadata=metadata,
             record_stamps=stamps,
             lower_bound=-5.0,
+            state_dtype=states.dtype,
         )
 
     launch()
@@ -1129,6 +1138,7 @@ def _check_gate_recovery(
         record_metadata=None,
         record_stamps=None,
         lower_bound=lower_bound,
+        state_dtype=state.dtype,
     )
     torch.testing.assert_close(state, expected, atol=2e-6, rtol=2e-5)
 
