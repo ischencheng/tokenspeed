@@ -26,8 +26,8 @@ import torch
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     finish_selection,
     prepare_candidate_scores,
+    prepare_native_block_scores,
     prepare_native_dense_scores,
-    prepare_scores,
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -95,10 +95,13 @@ def _select_topk_prepared(logits, ends, topk):
     """
     _validate(logits, ends, topk, 1, None)
     input_alignment, _ = deep_select_alignment()
-    alignment = input_alignment // logits.element_size()
-    # Contiguous rows must include the native vector-load padding.
+    # DeepSelect TMA jumps rows by stride(0). Column count need not be aligned;
+    # the last 512-wide segment stays inside a padded row when stride is.
     if not (
-        logits.shape[1] % alignment == 0 and logits.data_ptr() % input_alignment == 0
+        logits.stride(1) == 1
+        and logits.stride(0) >= logits.shape[1]
+        and (logits.stride(0) * logits.element_size()) % input_alignment == 0
+        and logits.data_ptr() % input_alignment == 0
     ):
         return select_topk(logits, ends, None, topk, 1)
     indices = _native_indices(logits, ends, topk)
@@ -130,8 +133,8 @@ def select_candidates(logits, valid_lengths, topk_blocks, block_size):
         )
     input_alignment, _ = deep_select_alignment()
     # block_size=1 still needs newest pin, unlike ordinary token preparation.
-    scores, ends = prepare_scores(
-        logits, valid_lengths, block_size, input_alignment // 4, True
+    scores, ends = prepare_native_block_scores(
+        logits, valid_lengths, block_size, input_alignment // 4
     )
     indices = _native_indices(scores, ends, topk_blocks)
     return finish_selection(

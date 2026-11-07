@@ -53,6 +53,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from multiprocessing import Pipe
@@ -66,6 +67,7 @@ from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -92,6 +94,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_ops_from_plan,
     engram_context_len,
     resolve_dspark_prefix_replay_tokens,
+    resolve_in_flight_depth,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.encode_host import EncodeBootstrap
@@ -123,7 +126,9 @@ from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     ReasoningGrammar,
     reasoning_grammar,
 )
-from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.metrics.config import metrics_enabled, raw_metrics_enabled
+from tokenspeed.runtime.metrics.events import MetricEvent, MetricEventSink
+from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
 from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
@@ -402,6 +407,9 @@ class HostConfig:
             model without Engram.
         request_token_history: The model reads each request's committed
             token history (``ModelConfig.requires_request_token_history``).
+        request_token_history_lookback: Committed tokens the model reads
+            behind the frontier, which bounds the history seeds; None seeds
+            the whole prefix.
         physical_context_len: Tokens a request's buffers hold.
         kv_total_pages: Usable cache pages, reported with the load.
         rank: This rank.
@@ -482,8 +490,10 @@ class HostConfig:
     spec_num_tokens: int | None
     ngram_context_len: int
     request_token_history: bool
+    request_token_history_lookback: int | None
     physical_context_len: int
     kv_total_pages: int
+    kv_token_capacity: int
     rank: int
     replica_ranks: tuple[int, ...]
     pp_ranks: tuple[int, ...] | None
@@ -519,6 +529,16 @@ class HostConfig:
     epd_receive_enabled: bool
     grammar: GrammarSettings | None
     eager_grammar: bool
+
+
+def host_in_flight_depth(server_args: ServerArgs) -> int:
+    """``HostConfig.in_flight_depth`` of a rank launched with
+    ``server_args`` (``resolve_in_flight_depth``)."""
+    return resolve_in_flight_depth(
+        disable_overlap_schedule=server_args.disable_overlap_schedule,
+        disaggregation_mode=server_args.disaggregation_mode,
+        pp_size=server_args.mapping.pp_size,
+    )
 
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
@@ -1019,6 +1039,81 @@ class HostDataPlane:
         )
 
 
+# Torch's allocator counters only exist in this rank's process; the Rust host
+# sees page counts, not bytes. Sample them here and report through the same
+# output plugin the engine's own metrics use.
+_MEMORY_METRIC_INTERVAL_SECONDS = 10.0
+
+
+class MemoryMetricSampler(threading.Thread):
+    """Emit allocator and driver memory gauges for one rank."""
+
+    def __init__(
+        self,
+        *,
+        sink: MetricEventSink,
+        model_name: str,
+        app_key: str,
+        dp_rank: int,
+        gpu_id: int,
+        device: str,
+    ) -> None:
+        super().__init__(name="ts-memory-metrics", daemon=True)
+        self._sink = sink
+        self._labels = {
+            "model_name": model_name,
+            "app_key": app_key,
+            "dp_rank": str(dp_rank),
+        }
+        self._gpu_id = gpu_id
+        self._device = device
+        self._stopping = threading.Event()
+
+    def stop(self) -> None:
+        self._stopping.set()
+        self.join(timeout=1.0)
+
+    def run(self) -> None:
+        try:
+            device_module = torch.get_device_module(torch.device(self._device).type)
+        except Exception as exc:
+            logger.warning(
+                f"Cannot initialize memory metrics for {self._device}: {exc}"
+            )
+            return
+        warned = False
+        while not self._stopping.wait(_MEMORY_METRIC_INTERVAL_SECONDS):
+            try:
+                free_bytes, total_bytes = device_module.mem_get_info(self._gpu_id)
+                allocated = device_module.memory_allocated(self._gpu_id)
+                reserved = device_module.memory_reserved(self._gpu_id)
+            except Exception as exc:
+                if not warned:
+                    logger.warning(
+                        f"Cannot sample memory on {self._device} GPU {self._gpu_id}: {exc}"
+                    )
+                    warned = True
+                continue
+            mib = 1024**2
+            used = total_bytes - free_bytes
+            values = {
+                "tokenspeed:mem_alloc_mb": allocated / mib,
+                "tokenspeed:mem_reserved_mb": reserved / mib,
+                "tokenspeed:mem_phys_used_mb": used / mib,
+                "tokenspeed:mem_non_torch_mb": max(0.0, used - reserved) / mib,
+            }
+            for metric, value in values.items():
+                self._sink.emit(
+                    MetricEvent(
+                        timestamp_ns=time.time_ns(),
+                        metric=metric,
+                        operation="set",
+                        value=float(value),
+                        labels=dict(self._labels),
+                    )
+                )
+
+
 class HostBootstrap:
     """One rank, built: the scheduler and config for the control thread, and
     the data plane the forward and control threads call."""
@@ -1039,6 +1134,9 @@ class HostBootstrap:
         self._connection = connection
         mapping = server_args.mapping
         gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+        self._gpu_id = gpu_id
+        self._port_args = port_args
+        self._memory_sampler: MemoryMetricSampler | None = None
         attn_tp_rank = mapping.attn.tp_rank
         dp_rank = mapping.attn.dp_rank
         global_rank = mapping.rank
@@ -1070,7 +1168,8 @@ class HostBootstrap:
             else:
                 draft_model_config = None
             ngram_context_len = engram_context_len(model_config.hf_text_config)
-            if ngram_context_len and mapping.has_pp:
+            in_flight_depth = host_in_flight_depth(server_args)
+            if ngram_context_len and in_flight_depth > 1:
                 raise NotImplementedError(
                     "Engram input history requires PP=1 and in-flight depth <= 1"
                 )
@@ -1233,10 +1332,7 @@ class HostBootstrap:
                 handshake_address=server_args.zmq_handshake_endpoint(),
                 engine_index=server_args.zmq_engine_index + dp_rank,
                 ready_response=zmq_wire.encode(ready_response),
-                # The chunk pipeline keeps one forward per stage in flight.
-                in_flight_depth=(
-                    mapping.pp_size if mapping.has_pp else overlap_schedule_depth
-                ),
+                in_flight_depth=in_flight_depth,
                 vocab_size=model_config.vocab_size,
                 eos_token_ids=tuple(sorted(eos_token_ids)),
                 top_k_exclusive_max=get_sampling_backend_class(
@@ -1256,10 +1352,21 @@ class HostBootstrap:
                 ),
                 ngram_context_len=ngram_context_len,
                 request_token_history=model_config.requires_request_token_history,
+                request_token_history_lookback=(
+                    resolve_history_seed_lookback(
+                        model_config.model_profile,
+                        (
+                            draft_model_config.model_profile
+                            if draft_model_config is not None
+                            else None
+                        ),
+                    )
+                ),
                 physical_context_len=(
                     model_config.context_len + server_args.spec_context_pad
                 ),
                 kv_total_pages=geometry.num_usable_pages,
+                kv_token_capacity=geometry.token_capacity,
                 rank=global_rank,
                 # Every stage runs the same plan, so with a pipeline the replica
                 # is the world (ServerArgs refuses attention DP with one). Under
@@ -1437,16 +1544,53 @@ class HostBootstrap:
             }
         )
 
+    def _start_memory_metrics(self) -> None:
+        """Sample this rank's accelerator memory, if an output plugin is on.
+
+        Only the rank that owns EngineMetrics reports, and only when a raw
+        reporter (not just Prometheus) selected this process's sink.
+        """
+        if self._memory_sampler is not None:
+            return
+        if not raw_metrics_enabled(self._server_args):
+            return
+        if self._server_args.mapping.attn.tp_rank != 0:
+            return
+        configs = self._port_args.metrics_producer_configs
+        if not configs:
+            return
+        try:
+            metrics_service.connect(configs)
+            sink = metrics_service.get_event_sink()
+        except Exception:
+            logger.warning("memory metrics are unavailable", exc_info=True)
+            return
+        if sink is None:
+            return
+        self._memory_sampler = MemoryMetricSampler(
+            sink=sink,
+            model_name=self._server_args.served_model_name or "",
+            app_key=self._server_args.app_key or "",
+            dp_rank=self._server_args.mapping.attn.dp_rank or 0,
+            gpu_id=self._gpu_id,
+            device=self._server_args.device,
+        )
+        self._memory_sampler.start()
+
     def enter_serving(self) -> None:
         """End startup: from here on a host synchronization or a kernel
         compilation on the data plane is a stall."""
         arm_data_plane_sync_debug(self._server_args.device)
         mark_jit_compile_serving()
         freeze_startup_heap()
+        self._start_memory_metrics()
 
     def close(self) -> None:
         """Release the device side's caches, once the forward thread and the
         L3 executor have stopped."""
+        if self._memory_sampler is not None:
+            self._memory_sampler.stop()
+            self._memory_sampler = None
         self._device.shutdown_cache()
 
 
