@@ -283,6 +283,14 @@ def test_minimax_m3_layers_open_on_the_previous_layers_layout(
     ]
 
 
+def _nvfp4_experts_config() -> MiniMaxM3Config:
+    # TP4 splits the experts to 64 intermediate columns per rank, the width
+    # SM90's Marlin NVFP4 kernel tiles; Blackwell's NVFP4 kernels take it too.
+    config = _tiny_config()
+    config.text_config.intermediate_size = 256
+    return config
+
+
 def _mixed_precision_config() -> "ModelOptMixedConfig":
     from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
         ModelOptMixedConfig,
@@ -340,7 +348,11 @@ def test_minimax_m3_mixed_precision_quant_dispatch(
         MinimaxM3QKVParallelLinearWithIndexer,
     )
 
-    model = _build_model(monkeypatch, quant_config=_mixed_precision_config())
+    model = _build_model(
+        monkeypatch,
+        quant_config=_mixed_precision_config(),
+        config=_nvfp4_experts_config(),
+    )
     attn = model.model.layers[3].self_attn
     # Sparse layers fuse q/k/v/index_q/index_k into one projection; its MXFP8
     # dispatch confirms the index members resolved to MXFP8 via the qkv unfuse.
@@ -418,7 +430,9 @@ def test_minimax_m3_mxfp8_nvfp4_quant_dispatch_and_expert_names(
         == "mxfp8_nvfp4"
     )
     quant_config = Mxfp8Nvfp4Config.from_config(hf_quant_config)
-    model = _build_model(monkeypatch, quant_config=quant_config)
+    model = _build_model(
+        monkeypatch, quant_config=quant_config, config=_nvfp4_experts_config()
+    )
     layer = model.model.layers[3]
     assert isinstance(layer.self_attn.qkv_proj.quant_method, Fp8LinearMethod)
     assert isinstance(
