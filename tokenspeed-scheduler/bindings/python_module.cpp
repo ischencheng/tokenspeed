@@ -59,13 +59,16 @@ namespace nb = nanobind;
 
 namespace {
 
-nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>> ReadonlyTokenView(const std::vector<std::int32_t>& tokens,
-                                                                          nb::handle owner) {
+const std::int32_t* Int32ViewData(const std::vector<std::int32_t>& values) {
     // NumPy treats a null data pointer as a request for writable storage,
     // even for an empty array. A non-null sentinel preserves read-only views.
     static constexpr std::int32_t empty = 0;
-    const auto* data = tokens.empty() ? &empty : tokens.data();
-    return {data, {tokens.size()}, owner};
+    return values.empty() ? &empty : values.data();
+}
+
+nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>> ReadonlyTokenView(const std::vector<std::int32_t>& tokens,
+                                                                          nb::handle owner) {
+    return {Int32ViewData(tokens), {tokens.size()}, owner};
 }
 
 template <typename Op, typename Cls>
@@ -129,17 +132,25 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                std::int32_t total_pages, tokenspeed::AttnKind attn_kind,
                std::optional<std::int32_t> sliding_window_tokens, std::int32_t cache_blocks_per_lcm_block,
                tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable,
-               std::int32_t checkpoint_granularity) {
+               std::int32_t checkpoint_granularity, std::int32_t sink_tokens) {
                 new (self) tokenspeed::CacheGroupConfig{
-                    std::move(group_id), block_granularity,      total_pages, cache_blocks_per_lcm_block,
-                    attn_kind,           sliding_window_tokens,  replayable,  transfer_policy,
-                    shard_count,         checkpoint_granularity,
+                    .group_id = std::move(group_id),
+                    .block_granularity = block_granularity,
+                    .total_pages = total_pages,
+                    .cache_blocks_per_lcm_block = cache_blocks_per_lcm_block,
+                    .attn_kind = attn_kind,
+                    .sliding_window_tokens = sliding_window_tokens,
+                    .sink_tokens = sink_tokens,
+                    .replayable = replayable,
+                    .transfer_policy = transfer_policy,
+                    .shard_count = shard_count,
+                    .checkpoint_granularity = checkpoint_granularity,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"), nb::arg("attn_kind"),
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
-            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1)
+            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1, nb::arg("sink_tokens") = 0)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -147,6 +158,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("shard_count", &tokenspeed::CacheGroupConfig::shard_count)
         .def_rw("attn_kind", &tokenspeed::CacheGroupConfig::attn_kind)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
+        .def_rw("sink_tokens", &tokenspeed::CacheGroupConfig::sink_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
         .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
@@ -155,6 +167,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     scheduler_config.def(nb::init<>())
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
+        .def_rw("enable_short_prefill_first", &tokenspeed::SchedulerConfig::enable_short_prefill_first)
         .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
@@ -180,6 +193,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
+        .def_rw("prefill_decode_interval", &tokenspeed::SchedulerConfig::prefill_decode_interval)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
@@ -311,7 +325,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
         .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)
         .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap)
-        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection);
+        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection)
+        .def_ro("compaction", &tokenspeed::CacheCoordinator::DeviceEvictionStats::compaction);
     nb::class_<tokenspeed::TierTransferManager::WriteBackStats>(m, "WriteBackStats")
         .def_ro("ops", &tokenspeed::TierTransferManager::WriteBackStats::ops)
         .def_ro("blocks", &tokenspeed::TierTransferManager::WriteBackStats::blocks)
@@ -345,6 +360,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
         .def_ro("demoted_entries_not_written_back", &tokenspeed::HostCacheStats::demoted_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
+        .def_ro("lone_compactions", &tokenspeed::HostCacheStats::lone_compactions)
+        .def_ro("lone_compaction_moves", &tokenspeed::HostCacheStats::lone_compaction_moves)
         .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
 
     // ─── ExecutionEvent ─────────────────────────────────────────────
@@ -436,6 +453,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::FailedEvent::request_id);
 
+    nb::class_<tokenspeed::pd::TransferStoppedEvent>(pd, "TransferStoppedEvent")
+        .def(nb::init<std::string>(), nb::arg("request_id"))
+        .def_ro("request_id", &tokenspeed::pd::TransferStoppedEvent::request_id);
+
     nb::class_<tokenspeed::pd::SucceededEvent>(pd, "SucceededEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::SucceededEvent::request_id);
@@ -494,27 +515,39 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  // ForwardBatch alive for the lifetime of each ndarray.
                  auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
                  nb::dict out;
-                 for (auto& [gid, buf] : op.block_tables_contig) {
-                     const std::size_t rows = op.request_ids.size();
-                     tokenspeed::FatalCheck(rows == 0 || buf.size() % rows == 0,
-                                            "block-table buffer must contain complete rows");
-                     const std::size_t columns = rows == 0 ? 0 : buf.size() / rows;
-                     out[nb::str(gid.c_str())] =
-                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, columns}, self);
+                 for (const auto& [gid, table] : op.block_tables) {
+                     const auto& buf = table.AbsoluteRows();
+                     out[nb::str(gid.c_str())] = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
+                         Int32ViewData(buf), {table.Rows(), table.Columns()}, self);
                  }
                  return out;
              })
+        .def(
+            "block_table_windows",
+            [](nb::handle self) {
+                auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                nb::dict out;
+                for (const auto& [gid, table] : op.block_tables) {
+                    const auto& buf = table.WindowRows();
+                    out[nb::str(gid.c_str())] =
+                        nb::make_tuple(nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
+                                           Int32ViewData(buf), {table.Rows(), table.WindowColumns()}, self),
+                                       table.Columns());
+                }
+                return out;
+            },
+            "Return read-only row windows and the absolute column count for each group. "
+            "Each window starts at max(pages - window_width, 0); the batch owns its data.")
         .def("block_table_spans",
              [](nb::handle self) {
                  // Zero-copy [rows, 2] int32 (released, pages) views parallel
                  // to block_tables_arrays; `self` keeps the batch alive too.
                  auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
                  nb::dict out;
-                 for (auto& [gid, buf] : op.block_table_spans) {
-                     const std::size_t rows = op.request_ids.size();
-                     tokenspeed::FatalCheck(buf.size() == 2 * rows, "block-table spans must cover every row");
-                     out[nb::str(gid.c_str())] =
-                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, 2}, self);
+                 for (const auto& [gid, table] : op.block_tables) {
+                     const auto& buf = table.Spans();
+                     out[nb::str(gid.c_str())] = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
+                         Int32ViewData(buf), {table.Rows(), 2}, self);
                  }
                  return out;
              })
@@ -588,10 +621,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     // A request the scheduler finished on its own while building the plan:
     // the last resort of a capacity retraction whose victim's KV image did not
-    // fit the host budgets. Already Finished on every rank; the runtime fails
-    // it toward the client with `detail` as the message.
+    // fit the host budgets, or a lone request on the fused role that made no
+    // progress for Scheduler::kNoProgressAbortPlans consecutive plans. Already
+    // Finished on every rank; the runtime fails it toward the client with
+    // `detail` as the message.
     nb::enum_<tokenspeed::AbortReason>(m, "AbortReason", nb::is_arithmetic())
-        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit);
+        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit)
+        .value("NoProgress", tokenspeed::AbortReason::kNoProgress);
     nb::class_<tokenspeed::SchedulerAbort>(m, "SchedulerAbort")
         .def_ro("request_id", &tokenspeed::SchedulerAbort::request_id)
         .def_ro("reason", &tokenspeed::SchedulerAbort::reason)
@@ -661,7 +697,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
         .def(
-            "next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); },
+            "next_execution_plan",
+            [](tokenspeed::Scheduler& s) {
+                // Python deliberately fixes ordinary scheduling for this API.
+                // Only the Rust host drives the serving prefill gate, passing
+                // both options explicitly for each plan.
+                return s.NextExecutionPlan(
+                    tokenspeed::Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
+            },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
         .def("drain_kv_events",

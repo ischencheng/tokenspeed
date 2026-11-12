@@ -16,7 +16,7 @@
 # SOFTWARE.
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -27,8 +27,13 @@ from tokenspeed_kernel.signature import (
     format_signature,
 )
 
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
+
 __all__ = [
     "quantize_fp8",
+    "output_fp8_quant_pack",
+    "try_output_fp8_quant_pack",
     "quantize_fp8_with_gate",
     "quantize_fp8_with_scale",
     "rmsnorm_quantize_fp8",
@@ -76,30 +81,34 @@ def rmsnorm_quantize_fp8_group32(
     weight: torch.Tensor,
     eps: float,
     *,
-    swizzled_scales: bool,
+    scale_layout: Literal["canonical", "swizzled", "packed"],
     override: str | None,
     solution: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Normalize BF16 [M,K] rows and quantize them with exact group-32 scales.
 
     Quantization preserves the 1e-4 amax floor and the BF16 normalization
-    boundary. Multiple GEMMs can share the codes and scales.
+    boundary. Multiple GEMMs can share the codes and scales, so every consumer
+    must read the layout asked for here.
 
     Args:
         x: BF16 rows ``[M, K]`` with unit inner stride; K divisible by 32.
         weight: Contiguous BF16 RMSNorm weight ``[K]`` on x's device.
         eps: Positive epsilon added to the row mean square.
-        swizzled_scales: Write the scales in FlashInfer's F8_128x4 layout,
-            which ``mm(prepacked_scales=True)`` reads without repacking them,
-            instead of the canonical one.
+        scale_layout: Layout the scales are written in. ``"canonical"`` is the
+            only one a caller can select rows of. ``"swizzled"`` is
+            FlashInfer's F8_128x4 layout, which ``mm(prepacked_scales=True)``
+            reads without repacking. ``"packed"`` is the MN-major int32 layout
+            ``fp8_projection`` reads, and needs K divisible by 128.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
     Returns:
-        BF16 normalized rows ``[M, K]``, E4M3 codes ``[M, K]`` and uint8
-        UE8M0 scales: canonical ``[M, K/32]``, or with ``swizzled_scales``
-        1-D F8_128x4 bytes for ``M`` rows padded to 128 and ``K/32`` scale
-        columns padded to 4, the padding zero.
+        BF16 normalized rows ``[M, K]``, E4M3 codes ``[M, K]`` and the scales:
+        canonical uint8 ``[M, K/32]``; swizzled 1-D uint8 F8_128x4 bytes for
+        ``M`` rows padded to 128 and ``K/32`` scale columns padded to 4, the
+        padding zero; or packed int32 ``[M, K/128]`` words, each four UE8M0
+        bytes little-endian, strided ``(1, M padded to 4)``.
     """
     kernel = select_kernel(
         "quantization",
@@ -109,7 +118,7 @@ def rmsnorm_quantize_fp8_group32(
         override=override,
         solution=solution,
     )
-    return kernel(x, weight, eps, swizzled_scales=swizzled_scales)
+    return kernel(x, weight, eps, scale_layout=scale_layout)
 
 
 def silu_and_mul_quantize_fp8_group32(
@@ -429,7 +438,9 @@ def _select_fp8_dynamic(
     traits = {
         "granularity": granularity_trait,
         "scale_encoding": scale_encoding,
-        "scale_layout": "token_major",
+        "scale_layout": (
+            "mn_major" if scale_encoding == "packed_ue8m0" else "token_major"
+        ),
     }
     if rows is not None:
         # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
@@ -833,6 +844,7 @@ def rmsnorm_nvfp4_quant(
     global_scale: torch.Tensor,
     mailbox_sentinel: int | None,
     enable_pdl: bool,
+    mailbox_publish: MailboxPublish | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """RMSNorm a BF16 row and quantize it to NVFP4 in one launch.
 
@@ -857,6 +869,8 @@ def rmsnorm_nvfp4_quant(
         mailbox_sentinel: The 32-bit word ``x`` is armed with, whose 16-bit
             halves agree, or None for an ordinary tensor.
         enable_pdl: Enable NVIDIA programmatic dependent launch.
+        mailbox_publish: This rank's block for the kernel to store into the
+            mailbox before it polls, or None when the producer stored it.
 
     Returns:
         ``(packed, scales)``: E2M1 pairs as ``uint8 [rows, width // 2]`` and
@@ -875,10 +889,12 @@ def rmsnorm_nvfp4_quant(
         global_scale,
         mailbox_sentinel,
         enable_pdl,
+        mailbox_publish,
     )
 
 
 # Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.quantization.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
@@ -887,3 +903,144 @@ from tokenspeed_kernel.ops.quantization.triton import (  # noqa: E402
     triton_rmsnorm_quantize_fp8,
     triton_silu_and_mul_quantize_fp8,
 )
+
+
+def _output_fp8_quant_pack_input_error(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    sigmoid_gate: bool,
+) -> str | None:
+    if (
+        x.ndim != 2
+        or x.dtype != torch.bfloat16
+        or not x.is_cuda
+        or x.stride(-1) != 1
+        or head_dim < 128
+        or head_dim & (head_dim - 1)
+        or x.shape[1] % head_dim
+        or x.shape[1] % 128
+    ):
+        return "requires BF16 [M,K], K%128=0, and aligned power-of-two heads"
+    expected = (
+        x.shape if z.ndim == 2 else (x.shape[0], x.shape[1] // head_dim, head_dim)
+    )
+    if (
+        z.shape != expected
+        or z.dtype != x.dtype
+        or z.device != x.device
+        or z.stride(-1) != 1
+    ):
+        return "gate must match the activation with unit inner stride"
+    if weight is not None and (
+        weight.shape != (head_dim,)
+        or weight.dtype != x.dtype
+        or weight.device != x.device
+        or not weight.is_contiguous()
+    ):
+        return "norm weight must be contiguous BF16 [head_dim] on the input device"
+    if weight is None and not sigmoid_gate:
+        return "the unnormalized output gate must be sigmoid"
+    return None
+
+
+def _launch_output_fp8_quant_pack(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    eps: float,
+    sigmoid_gate: bool,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kernel = select_kernel(
+        "quantization",
+        "output_fp8_packed",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        override=None,
+        solution=None,
+    )
+    return kernel(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )
+
+
+def try_output_fp8_quant_pack(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    eps: float,
+    sigmoid_gate: bool,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return fused codes and scales, or None for unsupported inputs."""
+    if (
+        _output_fp8_quant_pack_input_error(
+            x, z, weight, head_dim=head_dim, sigmoid_gate=sigmoid_gate
+        )
+        is not None
+    ):
+        return None
+    return _launch_output_fp8_quant_pack(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )
+
+
+def output_fp8_quant_pack(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    eps: float,
+    sigmoid_gate: bool,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse an output gate, optional per-head RMSNorm, and group128 DeepGEMM quant-pack.
+
+    Args:
+        x: BF16 [M,K] activations, unit inner stride.
+        z: BF16 gate, [M,K] or [M,H,D]; rows/heads may be strided.
+        weight: BF16 [head_dim] norm weight, or None for sigmoid-mul only.
+        head_dim: Power-of-two head width, divisible by 128.
+        eps: RMSNorm epsilon; unused without weight.
+        sigmoid_gate: True for sigmoid, False for SiLU after RMSNorm.
+        enable_pdl: Wait for the producer and signal dependent launches.
+
+    Returns:
+        E4M3 [M,K] codes and int32 packed UE8M0 [M,ceil(K/512)]
+        scales with strides [1,round_up(M,4)]. Padding is zero. The norm/gate
+        result rounds to BF16 before quantization, matching separate launches.
+    """
+    error = _output_fp8_quant_pack_input_error(
+        x, z, weight, head_dim=head_dim, sigmoid_gate=sigmoid_gate
+    )
+    if error is not None:
+        raise ValueError(error)
+    return _launch_output_fp8_quant_pack(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )

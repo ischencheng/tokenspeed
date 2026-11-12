@@ -26,11 +26,10 @@ import functools
 import logging
 
 import torch
-from tokenspeed_kernel.ops.gemm import (
-    mm,
-    prepare_mxfp8_weight_scales,
-)
+from tokenspeed_kernel.ops.gemm import mm, prepare_mxfp8_weight_scales
+from tokenspeed_kernel.ops.gemm.deepgemm import prepare_deepgemm_fp8_weight
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import pdl_enabled
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.parameter import (
@@ -101,6 +100,7 @@ class Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        self.block_solution: str | None = None
         # MXFP8 [1, 32] weights dequantized at load where no vendor GEMM takes
         # them on NVIDIA (mxfp8_linears_load_as_bf16); the layer then runs
         # unquantized.
@@ -109,6 +109,20 @@ class Fp8LinearMethod(LinearMethodBase):
         # 1x32 weight scales in the native GEMM's layout, or None for the
         # original path. see prepare_weight_scales.
         self.prepared_weight_scales: torch.Tensor | None = None
+        # DeepGEMM's E4M3 projection scales, when it serves this layer. They
+        # and the prepacked scales above are exclusive: a subclass that prepares
+        # both lets the activation's scale layout pick the GEMM.
+        self.projection_weight_scales: torch.Tensor | None = None
+
+    def _get_block_solution(self) -> str | None:
+        if self.block_solution is not None:
+            return self.block_solution
+        backend = global_server_args_dict["dense_gemm_backend"]
+        if backend in ("trtllm_cutedsl", "deepgemm") and tuple(
+            self.quant_config.weight_block_size
+        ) == (128, 128):
+            return backend
+        return None
 
     def create_weights(
         self,
@@ -248,6 +262,14 @@ class Fp8LinearMethod(LinearMethodBase):
             ):
                 self._dequantize_at_load(layer)
                 return
+            if self._get_block_solution() == "deepgemm":
+                weight, scales = prepare_deepgemm_fp8_weight(
+                    layer.weight, layer.weight_scale_inv
+                )
+                if weight is not layer.weight or scales is not layer.weight_scale_inv:
+                    layer.weight = Parameter(weight, requires_grad=False)
+                    layer.weight_scale_inv = Parameter(scales, requires_grad=False)
+                    self.block_solution = "deepgemm"
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -397,23 +419,21 @@ class Fp8LinearMethod(LinearMethodBase):
             return out if out is not None else output.view(*output_shape)
         if block_scale is None:
             scale_encoding = (
-                "ue8m0" if layer.weight_scale_inv.dtype == torch.uint8 else "float32"
+                "packed_ue8m0"
+                if layer.weight_scale_inv.dtype == torch.int32
+                else (
+                    "ue8m0"
+                    if layer.weight_scale_inv.dtype == torch.uint8
+                    else "float32"
+                )
             )
             input_2d, block_scale = quantize_fp8(
                 input_2d,
                 granularity="token_group",
                 group_size=self.quant_config.weight_block_size[1],
                 scale_encoding=scale_encoding,
+                enable_pdl=pdl_enabled(),
             )
-        solution = None
-        if global_server_args_dict["dense_gemm_backend"] in (
-            "trtllm_cutedsl",
-            "deepgemm",
-        ) and tuple(self.quant_config.weight_block_size) == (
-            128,
-            128,
-        ):
-            solution = global_server_args_dict["dense_gemm_backend"]
         output = mm(
             input_2d,
             layer.weight,
@@ -423,7 +443,7 @@ class Fp8LinearMethod(LinearMethodBase):
             out_dtype=output_dtype,
             quant="mxfp8",
             block_size=self.quant_config.weight_block_size,
-            solution=solution,
+            solution=self._get_block_solution(),
             out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
         )
         return (

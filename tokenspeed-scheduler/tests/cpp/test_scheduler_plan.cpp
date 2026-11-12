@@ -25,9 +25,11 @@
 #include <map>
 #include <memory>
 #include <ostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -450,12 +452,206 @@ TEST_F(HybridKvCacheEventTestSuite, DrainsATailBoundaryAlongsideAStateGroup) {
     SendForwardDone("r1", {42});
     SendFinish("r1");
 
-    // Only the prompt end has a state checkpoint, so only the tail [3] is complete; the page [1 2] stays partial.
+    // Only the prompt end has state, but the router needs the history parent
+    // before the tail can refer to it. This does not grant a state-cache hit.
     std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
-    ASSERT_EQ(events.size(), 1u);
-    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
-    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, (std::vector<std::int32_t>{3}));
+    ASSERT_EQ(events.size(), 2u);
+    const auto& page = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& tail = std::get<KvBlockStoredEvent>(events[1]);
+    EXPECT_EQ(page.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_FALSE(page.parent_block_hash);
+    EXPECT_EQ(tail.token_ids, (std::vector<std::int32_t>{3}));
+    EXPECT_EQ(tail.parent_block_hash, page.block_hashes.front());
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    Submit(RequestSpec{.request_id = "repeat", .tokens = {1, 2, 3}});
+    const ExecutionPlan first = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(first);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 0);
+    // The first repeat creates a checkpoint at the history junction. A later
+    // repeat may reuse it, whereas the complete prompt-end state cannot supply
+    // the logits for the prompt's last token.
+    SendForwardDone("repeat", {});
+    PlanOnce();
+    SendForwardDone("repeat", {43});
+    SendFinish("repeat");
+    PlanOnce();
+    Submit(RequestSpec{.request_id = "hit", .tokens = {1, 2, 3}});
+    const ExecutionPlan repeated = PlanOnce();
+    batch = FindForwardBatch(repeated);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 2);
+}
+
+class UnsupportedKvCacheEventLayoutSuite : public HybridKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = HybridKvCacheEventTestSuite::MakeConfig();
+        cfg.enable_kv_cache_events = false;
+        return cfg;
+    }
+};
+
+TEST_F(UnsupportedKvCacheEventLayoutSuite, RejectsEventsWithoutHistoryButKeepsServingLayouts) {
+    for (const bool state : {false, true}) {
+        for (const bool window : {false, true}) {
+            if (!state && !window) continue;
+            for (const bool replayable : {false, true}) {
+                if (replayable && !window) continue;
+                auto cfg = config_;
+                auto swa = cfg.cache_groups.front();
+                auto checkpoint = cfg.cache_groups.back();
+                cfg.cache_groups.clear();
+                if (state) cfg.cache_groups.push_back(checkpoint);
+                if (window) {
+                    swa.attn_kind = AttnKind::kSlidingWindow;
+                    swa.sliding_window_tokens = 2;
+                    swa.replayable = replayable;
+                    cfg.cache_groups.push_back(swa);
+                }
+                SCOPED_TRACE(::testing::Message()
+                             << "state=" << state << " window=" << window << " replayable=" << replayable);
+                SetTestSnapshotPool(cfg);
+                cfg.enable_kv_cache_events = true;
+                try {
+                    Scheduler rejected(WithHostPackingFromDevice(cfg));
+                    FAIL() << "unsupported event layout was accepted";
+                } catch (const std::invalid_argument& error) {
+                    EXPECT_NE(std::string(error.what()).find("KV cache events require"), std::string::npos);
+                }
+                cfg.enable_kv_cache_events = false;
+                scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+                Submit(RequestSpec{.request_id = "seed", .tokens = {1, 2, 3, 4, 5, 6}});
+                PlanOnce();
+                SendForwardDone("seed", {42});
+                SendFinish("seed");
+                EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+                EXPECT_TRUE(scheduler_->ClearCache());
+            }
+        }
+    }
+}
+
+TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShards) {
+    for (const std::int32_t tail_tokens : {0, 1, 2, 3, 4, 5, 6, 7}) {
+        SCOPED_TRACE(tail_tokens);
+        BlockPool device(12, {4, 2, 1, 1});
+        BlockPool host(12, {4, 2, 1, 1});
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                           .cache_blocks_per_lcm_block = 4,
+                           .block_granularity = 2,
+                           .shard_count = 2},
+            CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                           .cache_blocks_per_lcm_block = 2,
+                           .block_granularity = 4,
+                           .shard_count = 2},
+            CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+            CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                           .sliding_window = 2,
+                           .cache_blocks_per_lcm_block = 1,
+                           .block_granularity = 8}};
+        auto coordinator = MakeCoordinator(specs, 8, device, false, &host, nullptr, false, false, 0);
+        const CacheKey boundary{.content_hash = "prefix"};
+        std::vector<CacheKey> history;
+        for (std::uint32_t group = 0; group < 2; ++group) {
+            const auto granularity = specs[group].block_granularity;
+            const auto tokens = tail_tokens == 0 ? 8 : tail_tokens;
+            for (std::int32_t offset = 0; offset < (tokens + granularity - 1) / granularity; ++offset) {
+                history.push_back(
+                    CacheKey{.group_id = group, .content_hash = boundary.content_hash, .page_offset = offset});
+            }
+        }
+        const auto check = [&]() {
+            bool complete = true;
+            for (const auto& key : history) {
+                complete &= coordinator.GroupPrefixIndex(key.group_id).Contains(device, key);
+            }
+            EXPECT_EQ(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable, complete);
+        };
+        const auto store = [&](BlockPool& pool, const CacheKey& key) {
+            auto block = pool.AcquireBlock(key.group_id);
+            coordinator.GroupPrefixIndex(key.group_id)
+                .Register(pool, block, key, 1, -1, CacheBoundaryKind::kChunk, nullptr, nullptr);
+        };
+        const auto remove = [&](const CacheKey& key) {
+            auto& index = coordinator.GroupPrefixIndex(key.group_id);
+            const auto entry = index.Inspect(device, key);
+            ASSERT_TRUE(entry.has_value());
+            EXPECT_TRUE(index.Evict(device, entry->location).has_value());
+        };
+        check();
+        for (const auto& key : history) store(host, key);
+        check();  // Host history must not satisfy Device publication.
+        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        const CacheKey state{.group_id = 2, .content_hash = boundary.content_hash};
+        const CacheKey swa{.group_id = 3, .content_hash = boundary.content_hash};
+        store(device, state);
+        store(device, swa);
+        check();  // Auxiliary entries cannot fill missing history counts.
+        for (const auto& key : history) {
+            store(device, key);
+            check();
+        }
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable);
+        remove(state);
+        remove(swa);
+        check();  // Complete history remains publishable without auxiliary state.
+        EXPECT_EQ(coordinator.DeviceBoundaryResidency(boundary, tail_tokens),
+                  CacheCoordinator::BoundaryResidency::kPartial);
+        store(device, state);
+        store(device, swa);
+        // Removing any sub-block of either sharded Full group withdraws the
+        // event; restoring it makes the same boundary publishable again.
+        for (const auto& key : history) {
+            remove(key);
+            check();
+            EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable);
+            store(device, key);
+            check();
+        }
+        for (const auto& key : history) {
+            remove(key);
+            check();
+        }
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        remove(state);
+        remove(swa);
+        check();
+        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+    }
+}
+
+class FullSwaStateKvCacheEventTestSuite : public HybridKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = HybridKvCacheEventTestSuite::MakeConfig();
+        auto swa = cfg.cache_groups.front();
+        swa.group_id = "sliding_attention";
+        swa.attn_kind = AttnKind::kSlidingWindow;
+        swa.sliding_window_tokens = 2;
+        swa.replayable = false;
+        cfg.cache_groups.push_back(std::move(swa));
+        return cfg;
+    }
+};
+
+TEST_F(FullSwaStateKvCacheEventTestSuite, WindowDoesNotLeaveHolesInHistoryEvents) {
+    Submit(RequestSpec{.request_id = "seed", .tokens = {1, 2, 3, 4, 5, 6}});
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+    const auto events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 3u);
+    std::optional<std::uint64_t> parent;
+    for (const auto& event : events) {
+        const auto& block = std::get<KvBlockStoredEvent>(event);
+        EXPECT_EQ(block.parent_block_hash, parent);
+        parent = block.block_hashes.front();
+    }
+    ASSERT_TRUE(scheduler_->ClearCache());
+    EXPECT_EQ(scheduler_->DrainKvEvents().size(), 3u);
 }
 
 class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
@@ -845,7 +1041,9 @@ TEST_F(SlidingWindowRestoreKvCacheEventTestSuite,
     ASSERT_EQ(FindForwardBatch(PlanAndDrain())->request_ids, std::vector<std::string>{"r"});  // plan 8
     SendForwardDone("r", {105});
     PlanAndDrain();  // plan 9
-    EXPECT_TRUE(Stored({101, 102, 103, 104}));
+    // Registration still succeeds after the private pool restore, but the
+    // earlier history pages are not published. An orphan cannot be routed.
+    EXPECT_FALSE(Stored({101, 102, 103, 104}));
     SendForwardDone("r", {106});
     SendFinish("r");
     PlanAndDrain();
@@ -1104,6 +1302,20 @@ TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksUnpublishedPagesIsNotCarri
         << "its first chunk ends at the junction";
 }
 
+// Without prefix caching no probe can hit what the long chunk's admission
+// publishes, so the same prompt is carried at once, its whole prompt computed.
+TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksPagesIsCarriedBesideStateGroupsWithoutPrefixCaching) {
+    hybrid_ = true;
+    Restart(16);
+    config_.disable_prefix_cache = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::vector<std::int32_t> long_tokens = MakeTokens(100, 1000);
+    SubmitPrompt("long", long_tokens);
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    SubmitPrompt("sharing", Extending({long_tokens.begin(), long_tokens.begin() + 8}, {7001, 7002}));
+    EXPECT_EQ(Round(), (PrefillRows{{"sharing", 0, 10, 10}, {"long", 32, 52, 100}}));
+}
+
 // With only prompts too long to carry waiting, the plans are those without
 // the knob.
 TEST_F(PrefillChunkYieldSuite, WithOnlyLongPromptsWaitingThePlansAreThoseWithoutTheKnob) {
@@ -1295,8 +1507,9 @@ TEST_F(PrefillChunkYieldSuite, MirroredSchedulersPlanAlike) {
         for (int i = 0; i < 2; ++i, ++next) {
             submit("s" + std::to_string(next), MakeTokens(1 + next % 7, 10000 + 10 * next));
         }
-        const ExecutionPlan plan = ranks[0]->NextExecutionPlan();
-        ASSERT_TRUE(ranks[1]->NextExecutionPlan() == plan) << "round " << round;
+        const Scheduler::PlanOptions options{.allow_prefill = true, .apply_prefill_watermark = false};
+        const ExecutionPlan plan = ranks[0]->NextExecutionPlan(options);
+        ASSERT_TRUE(ranks[1]->NextExecutionPlan(options) == plan) << "round " << round;
         if (plan.remote_decode) {
             ExecutionEvent acks;
             for (const std::string& id : plan.remote_decode->request_ids) {
@@ -1405,6 +1618,358 @@ TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint)
     for (std::int32_t i = 0; i < 3; ++i) {
         const auto row = reuse->BlockTables().at("linear_attention_" + std::to_string(i)).at(0);
         EXPECT_GT(row.at(0), 0) << "the junction checkpoint is the chunk's input";
+    }
+}
+
+// prefill_decode_interval: after a round that schedules a prefill chunk, the
+// next N rounds that can schedule a decode run decodes alone, but no prompt
+// is held back more than N rounds in total.
+class PrefillDecodeIntervalSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.prefill_decode_interval = 2;
+        // Two pages per chunk: a 6-page prompt takes three prefill rounds.
+        cfg.max_scheduled_tokens = 4;
+        return cfg;
+    }
+
+    // Plans one round, lands its forward and returns what the round ran:
+    // "P:<ids>" when it scheduled a prefill chunk, "D:<ids>" for decodes only,
+    // "-" for no forward. `chunking` names prompts whose chunk this round
+    // leaves incomplete (an intermediate chunk produces no token). Retraction
+    // images and restores the plan starts land with it.
+    std::string Round(const std::set<std::string>& chunking = {}) {
+        const ExecutionPlan plan = PlanOnce();
+        AckImageStores(plan);
+        AckRestores(plan);
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr || batch->request_ids.empty()) {
+            return "-";
+        }
+        std::string ran = batch->NumExtends() > 0 ? "P:" : "D:";
+        for (const std::string& id : batch->request_ids) {
+            ran += id;
+            SendForwardDone(id, chunking.contains(id) ? std::vector<std::int32_t>{} : std::vector<std::int32_t>{7});
+        }
+        return ran;
+    }
+};
+
+TEST_F(PrefillDecodeIntervalSuite, ANewPromptWaitsForTheIntervalsDecodeRounds) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    EXPECT_EQ(Round(), "D:a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");  // the second decode round owed since a's prefill
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, ShortPrefillOrderingResumesAfterTheDecodeInterval) {
+    auto cfg = MakeConfig();
+    cfg.enable_short_prefill_first = true;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("long", 6, /*start=*/100));
+    Submit(MakeRequestSpec("short", 1, /*start=*/200));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"long"}), "P:shortlong");
+    // Both prompts used their interval allowance. The remaining long chunks
+    // run without another decode delay, even after short's first admission.
+    EXPECT_EQ(Round({"long"}), "P:long");
+    EXPECT_EQ(Round({"long"}), "P:long");
+    EXPECT_EQ(Round(), "P:long");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, APromptIsHeldBackAtMostTheIntervalAcrossItsChunks) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    // b's first chunk started a new interval, but b has already been held
+    // back two rounds: the interval is suspended until b is done.
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, SuspendedRoundsDoNotCountForAWaitingPrompt) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    Submit(MakeRequestSpec("c", 1, /*start=*/200));
+    // b's chunks fill each round's budget, so c waits behind them; the
+    // interval is suspended, so these rounds do not count against c.
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "P:c");
+}
+
+class PrefillDecodeIntervalTwoSlotsSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.max_batch_size = 2;
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeIntervalTwoSlotsSuite, APromptWaitingForASlotCountsTheRoundsItIsHeldBack) {
+    Submit(MakeRequestSpec("a", 1));
+    EXPECT_EQ(Round(), "P:a");
+    Submit({MakeRequestSpec("b", 6, /*start=*/100), MakeRequestSpec("c", 1, /*start=*/200)});
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    // b takes the second slot; c, held back two rounds, waits for a slot and
+    // suspends the interval meanwhile.
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+    SendFinish("a");
+    // b's last chunk started an interval that still owes a round, but c is
+    // overdue: it runs as soon as it has a slot.
+    EXPECT_EQ(Round(), "P:c");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, APromptRunsAtOnceWhenNoDecodeIsRunning) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    SendFinish("a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    // Two decode rounds are owed, but nothing can decode: the engine would
+    // idle, so the prefill runs.
+    EXPECT_EQ(Round(), "P:b");
+}
+
+TEST_F(PrefillDecodeIntervalTwoSlotsSuite, SuspendedDecodeRoundsDoNotCountForAWaitingPrompt) {
+    Submit(MakeRequestSpec("a", 1));
+    EXPECT_EQ(Round(), "P:a");
+    Submit({MakeRequestSpec("b", 6, /*start=*/100), MakeRequestSpec("c", 1, /*start=*/200)});
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    Submit(MakeRequestSpec("d", 1, /*start=*/300));
+    // c, overdue and without a slot, suspends the interval: these decode
+    // rounds do not count against d.
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "D:ab");
+    SendFinish("a");
+    EXPECT_EQ(Round(), "P:c");
+    EXPECT_EQ(Round(), "D:bc");
+    SendFinish("b");
+    // d has been held back one round, so the interval still holds it.
+    EXPECT_EQ(Round(), "D:c");
+    EXPECT_EQ(Round(), "P:d");
+}
+
+class PrefillDecodeIntervalRetractionSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.debug_force_retraction_interval = -5;  // the oldest Prefilling request, every fifth plan
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeIntervalRetractionSuite, ARestoredPromptKeepsTheRoundsItWasHeldBack) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");  // plan 5 retracts b
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_EQ(Round(), "D:a");  // b's restore rides beside the decode
+    ASSERT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(Round({"b"}), "P:b");
+    // b's chunk started a new interval, but b keeps the two rounds it was
+    // held back before its retraction.
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+class PrefillDecodeIntervalCapacitySuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.prefill_decode_interval = 9;
+        cfg.max_scheduled_tokens = 8;
+        cfg.device_allocator.total_pages = 14;
+        cfg.cache_groups.front().total_pages = 14;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeIntervalCapacitySuite, APromptRetractedWhileHeldBackCountsThatRound) {
+    Submit({MakeRequestSpec("a", 2), MakeRequestSpec("d", 1, /*start=*/300), MakeRequestSpec("b", 6, /*start=*/100)});
+    EXPECT_EQ(Round({"b"}), "P:adb");
+    for (int i = 0; i < 8; ++i) {
+        EXPECT_EQ(Round(), "D:ad");
+    }
+    // The ninth round b is held back, a's next page retracts it.
+    EXPECT_EQ(Round(), "D:ad");
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    SendFinish("a");
+    EXPECT_EQ(Round(), "D:d");  // b's restore rides beside the decode
+    EXPECT_EQ(Round({"b"}), "P:b");
+    // b's chunk started a new interval, but the round b was retracted in
+    // counts: b has been held back nine rounds and runs on.
+    EXPECT_EQ(Round(), "P:b");
+}
+
+class MixedPrefillDecodeIntervalSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        cfg.max_scheduled_tokens = 64;
+        return cfg;
+    }
+};
+
+TEST_F(MixedPrefillDecodeIntervalSuite, ADeferredPromptJoinsNoDecodeRound) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:ba");  // the mixed round: prefill rows first
+}
+
+// Ten pages: few enough that a running decode runs out of pages while a
+// prompt waits.
+class MixedPrefillDecodeIntervalCapacitySuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        cfg.prefill_decode_interval = 4;
+        cfg.max_scheduled_tokens = 8;
+        cfg.device_allocator.total_pages = 10;
+        cfg.cache_groups.front().total_pages = 10;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantedFirstAdmissionCountsTowardOldestProtection) {
+    for (const bool abort_victim : {false, true}) {
+        SCOPED_TRACE(abort_victim ? "abort grant" : "retraction grant");
+        auto cfg = MakeConfig();
+        cfg.prefill_decode_interval = 0;
+        cfg.enable_short_prefill_first = true;
+        if (abort_victim) {
+            cfg.snapshot_allocator.total_pages = 1;
+            cfg.max_retracted_requests = 0;
+        }
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+        Submit(
+            {MakeRequestSpec("c", 1, /*start=*/300), MakeRequestSpec("e", 1, /*start=*/500), MakeRequestSpec("a", 2)});
+        EXPECT_EQ(Round(), "P:cea");
+        EXPECT_EQ(Round(), "D:cea");
+        EXPECT_EQ(Round(), "D:cea");
+
+        Submit(MakeRequestSpec("old", 6, /*start=*/100));
+        Submit(MakeRequestSpec("short", 4, /*start=*/200));
+        // Neither prompt fits until a gives up its pages. The shorter prompt receives
+        // the freed capacity after its ordinary admission failed this round.
+        const auto grant = PlanOnce();
+        const auto* batch = FindForwardBatch(grant);
+        ASSERT_NE(batch, nullptr);
+        EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"short", "c", "e"}));
+        ASSERT_EQ(grant.aborts.size(), abort_victim ? 1u : 0u);
+        if (abort_victim) {
+            EXPECT_EQ(grant.aborts.front().request_id, "a");
+            EXPECT_EQ(grant.aborts.front().reason, AbortReason::kImageDoesNotFit);
+        }
+        ASSERT_EQ(scheduler_->RetractedSize(), abort_victim ? 0u : 1u);
+        AckImageStores(grant);
+        SendForwardDone("short");
+        SendForwardDone("c", {7});
+        SendForwardDone("e", {7});
+        SendFinish("c");
+        SendFinish("e");
+        if (!abort_victim) {
+            SendAbortEvent("a");
+        }
+        SendAbortEvent("short");
+
+        // The grant was the first bypass. Seven ordinary admissions fill the
+        // remaining allowance; each consumes the round's entire token budget.
+        for (int i = 0; i < 7; ++i) {
+            const std::string id = "s" + std::to_string(i);
+            Submit(MakeRequestSpec(id, 4, /*start=*/1000 + i * 100));
+            EXPECT_EQ(Round(), "P:" + id);
+            SendFinish(id);
+        }
+        Submit(MakeRequestSpec("later", 4, /*start=*/2000));
+        EXPECT_EQ(Round({"old"}), "P:old");
+    }
+}
+
+TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantAdmittedPromptIsNotHeldBackThatRound) {
+    Submit({MakeRequestSpec("c", 1, /*start=*/300), MakeRequestSpec("e", 1, /*start=*/500), MakeRequestSpec("a", 2)});
+    EXPECT_EQ(Round(), "P:cea");
+    Submit(MakeRequestSpec("b", 4, /*start=*/100));
+    EXPECT_EQ(Round(), "D:cea");
+    EXPECT_EQ(Round(), "D:cea");
+    // The interval still owes this round, but a's next page does not fit:
+    // the scheduler retracts a and grants its pages to b, whose first chunk
+    // runs beside the decodes and starts a new interval.
+    EXPECT_EQ(Round({"b"}), "P:bce");
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    SendFinish("e");  // frees the pages b's next chunk needs
+    // b has been held back two rounds, not three: the new interval holds its
+    // next chunk for two more.
+    EXPECT_EQ(Round(), "D:c");
+    EXPECT_EQ(Round(), "D:c");
+    EXPECT_EQ(Round(), "P:bc");
+}
+
+TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole) {
+    const auto config = [](Role role, std::int32_t interval) {
+        SchedulerConfig cfg{};
+        cfg.role = role;
+        cfg.prefix_granularity = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.device_allocator.total_pages = 32;
+        cfg.disable_l2_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = 32,
+        });
+        if (role != Role::kFused) {
+            cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.prefill_decode_interval = interval;
+        return WithHostPackingFromDevice(cfg);
+    };
+    EXPECT_NO_THROW(config(Role::kFused, 4).Validate());
+    for (const auto& [role, interval] : {std::pair{Role::kP, 4}, std::pair{Role::kD, 4}, std::pair{Role::kFused, -1}}) {
+        try {
+            config(role, interval).Validate();
+            ADD_FAILURE() << "prefill_decode_interval " << interval << " was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find("prefill_decode_interval"), std::string::npos) << error.what();
+        }
     }
 }
 

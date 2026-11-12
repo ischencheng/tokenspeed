@@ -36,6 +36,9 @@ from tokenspeed_kernel.platform import current_platform
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris import IrisGroup
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
 
 logger = logging.getLogger(__file__)
 
@@ -77,6 +80,45 @@ def discover_iris_world() -> bool:
     from tokenspeed_kernel.ops.communication._iris import discover_world
 
     return discover_world()
+
+
+def reserve_iris_heap(owner: str, nbytes: int) -> None:
+    """Reserve ``nbytes`` of the shared Iris heap for ``owner``, replacing its
+    earlier reservation. The heap is created with every reservation on top of
+    the size its creator planned, so call this before the heap exists: a live
+    heap does not grow."""
+    from tokenspeed_kernel.ops.communication._iris import reserve_heap
+
+    reserve_heap(owner, nbytes)
+
+
+def iris_heap_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
+    """The heap bytes that an allocation of ``shape`` and ``dtype`` takes,
+    alignment included."""
+    from tokenspeed_kernel.ops.communication._iris import allocation_bytes
+
+    return allocation_bytes(shape, dtype)
+
+
+def iris_symmetric_heap(group: dist.ProcessGroup, rank: int, device: torch.device):
+    """The shared Iris context and the heap addresses of ``group``'s ranks
+    (``rank`` this process's rank in it), once the communication preparation
+    has created the heap. Buffers allocated from the context must have been
+    reserved (``reserve_iris_heap``) before the heap existed.
+
+    Returns:
+        ``(context, iris_group)``: ``context.zeros(shape, dtype=)`` allocates
+        at the same heap offset on every rank; ``iris_group.bases`` holds each
+        rank's heap base, and ``iris_group.finish_prepare()`` ends the group's
+        preparation.
+
+    Raises:
+        RuntimeError: The heap does not exist yet.
+    """
+    from tokenspeed_kernel.ops.communication._iris import IrisGroup, existing_context
+
+    context = existing_context()
+    return context, IrisGroup(context, group, rank, device)
 
 
 def iris_maps_world() -> bool | None:
@@ -405,6 +447,80 @@ def iris_all_reduce_symmetric(
 ) -> tuple[torch.Tensor, ...]:
     """Return caller-owned reductions of consecutive symmetric producer outputs."""
     return state.all_reduce_symmetric(tensors)
+
+
+def iris_lamport_residual_rmsnorm_supported(
+    world_size: int, hidden_size: int, dtype: torch.dtype
+) -> bool:
+    """Whether the row-owned Lamport reduction + residual RMSNorm serves a group.
+
+    Args:
+        world_size: Number of ranks in the group.
+        hidden_size: Row width in elements.
+        dtype: Element type of the reduced rows and the residual.
+
+    Returns:
+        Whether this device has the kernel for this group size, width and dtype.
+    """
+    # Iris is installed only on ROCm, so check the device before importing it.
+    if dtype != torch.bfloat16 or not _platform.is_cdna4:
+        return False
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
+
+    return LamportResidualRMSNorm.supported(world_size, hidden_size)
+
+
+def prepare_iris_lamport_residual_rmsnorm(
+    all_reduce: IrisAllReduce, max_rows: int, hidden_size: int
+) -> "LamportResidualRMSNorm":
+    """Allocate the fused reduction's mailboxes on a prepared group's heap.
+
+    Collective: every rank of the group calls it in the same order, before
+    graph capture. The mailboxes come from the shared heap that the group's
+    first preparation sized; Iris's allocator enforces its capacity.
+
+    Args:
+        all_reduce: The group's prepared all-reduce, which supplies the peers.
+        max_rows: Most rows one call reduces, at most
+            ``LamportResidualRMSNorm.MAX_ROWS``.
+        hidden_size: Row width in elements.
+
+    Returns:
+        The prepared operation, used with ``iris_lamport_residual_rmsnorm``.
+    """
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
+
+    state = LamportResidualRMSNorm(all_reduce.peers, max_rows, hidden_size)
+    all_reduce.peers.finish_prepare()
+    return state
+
+
+def iris_lamport_residual_rmsnorm(
+    state: "LamportResidualRMSNorm",
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sum ``tensor`` over the group, add ``residual`` and apply RMSNorm.
+
+    Args:
+        state: The group's prepared operation.
+        tensor: BF16 ``[rows, hidden]`` partial, at most the prepared rows.
+        residual: BF16 ``[rows, hidden]`` residual, the same on every rank.
+        weight: ``[hidden]`` RMSNorm weight.
+        eps: RMSNorm epsilon, a model constant (it is compiled in).
+
+    Returns:
+        ``(normalized, residual_out)`` as new BF16 tensors, equal to
+        ``rmsnorm(all_reduce(tensor), weight, eps, residual=residual)`` with
+        the sum taken in FP32 rank order and rounded once to BF16.
+    """
+    return state.run(tensor, residual, weight, eps)
 
 
 class IrisAllReduceResidualRMSNorm(object):

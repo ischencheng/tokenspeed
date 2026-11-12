@@ -127,7 +127,11 @@ class MHATokenToKVPool(CachePool):
         heads_l = self._layer_heads_per_rank(layer_id)
         if heads_l == self.head_num:
             return buf
-        return buf.reshape(-1, heads_l, self.head_dim)
+        return (
+            buf.view(buf.shape[0], -1, heads_l, self.head_dim)
+            if buf.ndim == 4
+            else buf.view(-1, heads_l, self.head_dim)
+        )
 
     def _layer_heads_per_rank(self, layer_id: int) -> int:
         counts = self._layer_kv_head_counts
@@ -197,6 +201,10 @@ class MHATokenToKVPool(CachePool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        # Wait for the layer's Host load: a tail hit loads the page these
+        # rows land in whole.
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -321,6 +329,10 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     ):
         """Quantize K/V rows to MXFP8 and scatter them with their block scales."""
         layer_id = layer.layer_id
+        # Wait for the layer's Host load: a tail hit loads the page these
+        # rows land in whole.
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         # Locs are per-layer view rows: target the served view
         k_rows = self._layer_row_view(self.k_buffer[layer_id], layer_id)
         v_rows = self._layer_row_view(self.v_buffer[layer_id], layer_id)

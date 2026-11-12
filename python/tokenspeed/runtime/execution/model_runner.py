@@ -346,7 +346,6 @@ class ModelRunner:
         input_embeds: torch.Tensor | None = None,
         multimodal_context: MultimodalForwardContext | None = None,
         spec_step_idx: int | None = None,
-        kv_sync_event: "torch.cuda.Event | None" = None,
         pp_inbound=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
@@ -362,8 +361,6 @@ class ModelRunner:
             kwargs["multimodal_context"] = multimodal_context
         if spec_step_idx is not None and self.forward_accepts_spec_step_idx:
             kwargs["spec_step_idx"] = spec_step_idx
-        if kv_sync_event is not None:
-            kwargs["kv_sync_event"] = kv_sync_event
 
         return self.model.forward(
             ctx,
@@ -462,6 +459,11 @@ class ModelRunner:
         """Receive trainer-broadcast weights over the NCCL group and load them."""
         import torch.distributed as dist
 
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         pg = self._weight_update_pg
         if pg is None:
             return False, "weight update group not initialized"
@@ -515,10 +517,9 @@ class ModelRunner:
         """Read one committed weight-store version into ``models`` in place.
 
         Runs on the forward thread. The SDK streams partial ``load_weights``
-        calls, so the models are bracketed in a weight-update session; the
-        SDK's device staging buffers are released afterwards -- also when the
-        read failed partway -- because PyTorch would otherwise keep the blocks
-        cached against the KV arena.
+        calls, so the models are bracketed in a weight-update session. Wait for
+        the runner's accelerator to complete the update before acknowledging it
+        and clear its allocator cache on both success and failure.
 
         Args:
             version: The committed version to load.
@@ -531,11 +532,17 @@ class ModelRunner:
         Returns:
             ``(ok, message)`` for the control plane.
         """
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         if self.model_update is None:
             return False, (
                 "update_weights_from_mooncake requires the server to start with "
                 "--model-update-config (target runner only)"
             )
+        device_module = torch.get_device_module(self.device)
         try:
             with weight_update_session(
                 models,
@@ -545,13 +552,13 @@ class ModelRunner:
                 ),
             ):
                 result = self.model_update.update(models, version, snapshot=snapshot)
-            torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+            device_module.synchronize(self.gpu_id)
             return True, f"applied model version {version}: {result}"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_mooncake failed")
             return False, str(e)
         finally:
-            torch.cuda.empty_cache()
+            device_module.empty_cache()
 
     def update_weights_from_disk(self, obj) -> tuple[bool, str]:
         """Reload this worker's parameters in place from a checkpoint directory.
@@ -578,6 +585,11 @@ class ModelRunner:
             post_load_transformed_modules,
         )
 
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         model_path = str(obj.model_path)
         transformed = post_load_transformed_modules(self.model)
         if transformed:

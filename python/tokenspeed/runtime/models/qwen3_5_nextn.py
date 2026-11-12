@@ -126,7 +126,13 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
                 f"(got {config.num_hidden_layers}); the draft row narrowing "
                 "happens once, at the single layer's attention."
             )
-        super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config,
+            mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            enable_fp8_attn_proj=False,
+        )
 
 
 class Qwen3_5ForConditionalGenerationNextN(nn.Module):
@@ -194,6 +200,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
             do_argmax=True,
+            attn_tp_size=self.mapping.attn.tp_size,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
 
@@ -263,10 +270,11 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 input_embeds=hidden_states,
             )
 
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, logits_metadata
-        )
+            # Keep the narrowed draft row counts active through the head exchange.
+            logits_metadata = LogitsMetadata.from_forward_context(ctx)
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, logits_metadata
+            )
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         """Shard preselection for ``load_weights`` (see DefaultModelLoader).

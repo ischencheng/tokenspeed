@@ -72,15 +72,25 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+`mv_fp8_weight` projects 16-bit rows through a weight-only FP8 weight: E4M3
+with one FP32 scale per output channel, as a 16-bit checkpoint quantizes at
+load. Activations stay 16-bit, so the only roundings past the weight's are
+the FP32 sums' and the output's. The `("gemm", "mv_fp8_weight")` operation
+takes up to `MV_FP8_WEIGHT_MAX_M` rows a launch, larger calls run in chunks of
+that many, and the Torch reference upcasts the weight a chunk at a time.
+
 `mv_weightless_rmsnorm_gated_sigmoid` normalizes, gates and projects one row
 through the `("gemm", "mv_weightless_rmsnorm_gated_sigmoid")` operation. A
 registered kernel serves it only where the separate gated norm and `mv` select
 the kernels it reproduces bit for bit; otherwise callers keep the two calls.
 
-On SM107, FlashInfer's TGV/CuTe DSL search supports BF16 output projections
-with weight shape `[2560, 6144]` and M <= 4. Startup tuning covers M=1/2/4.
-The kernels accumulate in FP32 and return BF16; reduction order can change
-rounding relative to the original GEMM.
+On SM107, BF16 output projections whose weight shape is in the measured
+`_SM107_BF16_GEMM_SHAPES` set (the TP4 per-rank projections plus the TP1
+`[2560, 6144]` o_proj) run FlashInfer's CuTe DSL low-latency GEMM at M <= 4,
+pinned as the measured winner on every admitted shape; other shapes keep
+their existing path. Startup tuning covers M=1/2/4. The kernels accumulate
+in FP32 and return BF16; reduction order can change rounding relative to
+the original GEMM.
 
 ## Decode GEMMs on small weights
 
@@ -168,19 +178,29 @@ larger observed inputs and the enclosing native bucket. Native mappers,
 constraints, and caches are preserved. Explicit buckets and disabled profiling
 retain their semantics; small-M BF16 keeps its existing bound.
 
-## Hopper block-FP8 DeepGEMM
+## Block-FP8 DeepGEMM
 
-`deepgemm_mm_fp8_blockscale` supports explicit `mm(..., override=...)` or
-`solution="deepgemm"` selection. Serving can opt in with
+`solution="deepgemm"` selects the appropriate block-FP8 kernel for the GPU.
+Explicit overrides are `deepgemm_mm_fp8_blockscale` on SM90 and
+`deepgemm_mm_fp8_blockscale_packed` on SM100/SM103. Serving can opt in with
 `--dense-gemm-backend deepgemm` for standard block-FP8 dense linears. The
 default `auto` route remains unchanged; routed experts use their own backend.
 
-This optional DeepGEMM integration requires Hopper, contiguous E4M3 operands
-A[M,K]/B[N,K], BF16 output, N divisible by 64, and K divisible by 128. It
-converts canonical FP32 1x128 activation and 128x128 weight scales to the
-required layout without UE8M0 rounding. Conversion is part of each call,
+This optional DeepGEMM integration supports SM90, SM100 and SM103, contiguous
+E4M3 operands A[M,K]/B[N,K], BF16 output, N divisible by 64, and K divisible
+by 128. On Hopper it converts canonical FP32 1x128 activation and 128x128
+weight scales to the required layout without UE8M0 rounding. Conversion is part of each call,
 including graph capture; no persistent weight cache is created. Unsupported
 forced calls fail explicitly. It does not claim batch-invariant numerics.
+
+On SM100/SM103, dense FP8 layers configured for DeepGEMM call
+`prepare_deepgemm_fp8_weight` after loading. It requantizes weights onto
+power-of-two scales and packs them once. The layer pins DeepGEMM for forward.
+Activations use the registered `packed_ue8m0` quantizer,
+which directly writes TMA-aligned int32 scales with initialized padding.
+GEMM consumes these packed scales without per-call copies or packing.
+The quantizer and DeepGEMM follow the global PDL setting and work in CUDA
+Graphs and on auxiliary streams. Default FP32-scale dispatch is unchanged.
 
 ## Grouped FP8 projection
 

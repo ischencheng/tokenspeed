@@ -30,7 +30,7 @@ contracts must satisfy: a group must retain every token its layers can see.
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from tokenspeed_kernel.ops.attention.prologue import (
@@ -62,6 +62,9 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     K_CACHE_SCALE_SUFFIXES,
     V_CACHE_SCALE_SUFFIXES,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
 
 @dataclass(frozen=True)
@@ -138,6 +141,7 @@ class PagedAttention(nn.Module):
         logit_cap: float = 0.0,
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
+        sliding_window_sink: int = 0,
         *,
         rotary_emb: HeadRotary | None,
         qk_norm: tuple[HeadRMSNorm, HeadRMSNorm] | None,
@@ -162,6 +166,19 @@ class PagedAttention(nn.Module):
                 f"{sliding_window_size!r}"
             )
         self.sliding_window_size = int(sliding_window_size)
+        # Leading tokens kept visible outside the window (attention sinks).
+        if sliding_window_sink is None or sliding_window_sink < 0:
+            raise ValueError(
+                f"PagedAttention layer_id={layer_id}: sliding_window_sink is a "
+                f"token count >= 0, got {sliding_window_sink!r}"
+            )
+        if sliding_window_sink and sliding_window_size < 0:
+            raise ValueError(
+                f"PagedAttention layer_id={layer_id}: sliding_window_sink="
+                f"{sliding_window_sink} needs a sliding window; full attention "
+                "already keeps those rows"
+            )
+        self.sliding_window_sink = int(sliding_window_sink)
         # The cache group this layer's KV rides, bound at startup by bind_cache_groups.
         self._group_id: str | None = None
         self.rotary_emb = rotary_emb
@@ -270,6 +287,15 @@ class PagedAttention(nn.Module):
             ctx=ctx,
             **kwargs,
         )
+
+    def decode_kv_view(self, ctx: ForwardContext) -> "DecodeKVView | None":
+        """This layer's paged cache and decode metadata, for a kernel that runs
+        its decode attention inside a larger launch, or None when the backend
+        does not expose them (:meth:`AttentionBackend.decode_kv_view`) or the
+        forward is not a decode."""
+        if not ctx.forward_mode.is_decode():
+            return None
+        return ctx.attn_backend.decode_kv_view(self, ctx.token_to_kv_pool)
 
     def prologue(
         self,
@@ -569,6 +595,7 @@ class _CacheGroupSpecLike(Protocol):
     group_id: str
     attn_kind: str
     sliding_window_tokens: int | None
+    sink_tokens: int
 
 
 class _CacheArenaLike(Protocol):
@@ -626,6 +653,11 @@ def _check_visibility_within_retention(
             f"sees the full history but its cache group {spec.group_id!r} "
             f"retains only a {retained}-token window."
         )
+    if layer.sliding_window_sink > spec.sink_tokens:
+        raise ValueError(
+            f"{model_name}: attention layer {name!r} needs {layer.sliding_window_sink} "
+            f"sink tokens but cache group {spec.group_id!r} retains {spec.sink_tokens}."
+        )
     # The scheduler keeps the last `retained - 1` computed tokens ahead of
     # the next position (GroupGeometry::ExpiredBlocksAt), exactly the HF
     # window minus the current token.
@@ -640,15 +672,11 @@ def _check_visibility_within_retention(
 def check_block_drafter_storage(
     draft_model: nn.Module, target_cache_pool: _CacheViewLike
 ) -> None:
-    """A block drafter writes at the target's cache locations, so every one of
-    its layers must ride a full-history group the target's own layers share.
+    """Validate a block drafter's bound history groups and visibility.
 
-    Bind the draft first (:func:`bind_cache_groups`). Without a target
-    full-history group there is nothing to borrow: the draft's KV would sit
-    in a group of its own while the target router hands it another group's
-    slots.
+    Context and proposal writes both use the draft router, so its history
+    may belong to a dedicated sliding group or a target-shared full group.
     """
-    target_groups = set(target_cache_pool.history_group_by_layer().values())
     specs = {
         str(spec.group_id): spec for spec in target_cache_pool.arena.cache_group_specs
     }
@@ -656,11 +684,10 @@ def check_block_drafter_storage(
     for name, module in draft_model.named_modules():
         if not isinstance(module, PagedAttention):
             continue
-        group_id = module.group_id
-        if group_id not in target_groups or specs[group_id].attn_kind != "full_history":
+        spec = specs.get(module.group_id)
+        if spec is None or spec.attn_kind not in ("full_history", "sliding_window"):
             raise ValueError(
-                f"{model_name}: block drafter layer {name!r} (layer_id="
-                f"{module.layer_id}) rides cache group {group_id!r}, but a block "
-                "drafter must share a full-history group with the target's "
-                f"layers (target groups: {sorted(target_groups)})."
+                f"{model_name}: block drafter layer {name!r} requires a history "
+                f"cache group, got {module.group_id!r}."
             )
+        _check_visibility_within_retention(model_name, name, module, spec)

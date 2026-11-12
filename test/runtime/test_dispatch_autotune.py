@@ -78,6 +78,7 @@ from tokenspeed.runtime.layers.dense.unquant import (  # noqa: E402
     UnquantizedLinearMethod,
 )
 from tokenspeed.runtime.utils import env as env_module  # noqa: E402
+from tokenspeed.runtime.utils import server_args as server_args_module  # noqa: E402
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 
@@ -304,6 +305,9 @@ class _AutotuneExecutor:
         self._model_input_kwargs_hook = model_input_kwargs
         self._events = events
         self.device = "cpu"
+        # The stub gathers whole sampled rows, so autotune() runs no
+        # vocab-shard warmup.
+        self._samples_from_vocab_shard = False
 
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
@@ -311,6 +315,18 @@ class _AutotuneExecutor:
     def _autotune_draft_experts(self, num_tokens):
         assert tuning_module.is_warming_up()
         self._events.append(("draft_experts", num_tokens))
+
+
+class _DrafterDouble:
+    """Records the startup's extend warmup (``BaseDrafter.warmup_extend``); a
+    real drafter needs a draft model and its runner."""
+
+    def __init__(self, events):
+        self._events = events
+
+    def warmup_extend(self, num_tokens):
+        assert tuning_module.is_warming_up()
+        self._events.append(("draft_extend", num_tokens))
 
 
 class _ProcessGroupManagerDouble:
@@ -325,6 +341,7 @@ class _ProcessGroupManagerDouble:
         return self._group
 
 
+@pytest.mark.parametrize("max_decode_bs", [1, 8])
 @pytest.mark.parametrize("attention_tp_size", [1, 2, 8])
 @pytest.mark.parametrize("chunk_size", [-1, 16, 17])
 @pytest.mark.parametrize("speculative", [False, True])
@@ -340,6 +357,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     failure,
     prefill_only,
     attention_tp_size,
+    max_decode_bs,
 ):
     events = []
     metadata = []
@@ -369,7 +387,8 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             raise RuntimeError("profiling failed")
 
     def draft(*, batch_sizes, graph_phase):
-        assert batch_sizes == (attention_tp_size,)
+        # One request per attention TP peer, within the decode state.
+        assert batch_sizes == (min(attention_tp_size, max_decode_bs),)
         assert tuning_module.is_autotuning() is (
             not disabled and tuning_module._autotuner is not None
         )
@@ -400,8 +419,10 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         ),
         prefill_graph=_PrefillGraphDouble(make_dummy_batch=prefill_batch),
         # Deliberately no capture_bs or graph-enabled flag: neither controls tuning.
-        forward_step=_ForwardStepDouble(warmup_decode_path=draft),
-        drafter=object() if speculative else None,
+        forward_step=_ForwardStepDouble(
+            warmup_decode_path=draft, max_decode_bs=max_decode_bs
+        ),
+        drafter=_DrafterDouble(events) if speculative else None,
         model_input_kwargs=lambda n, bs, rows: {
             "engram_hash_ids": ngram_history[rows],
             "engram_token_mask": ngram_mask[rows],
@@ -433,7 +454,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     )
     if failure:
         with pytest.raises(RuntimeError, match="profiling failed"):
-            ModelExecutor.autotune(executor)
+            ModelExecutor.autotune(executor, keep_loaded_tactics=False)
         assert events == [
             "load",
             ("group", None),
@@ -442,14 +463,17 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             ("group", None),
         ]
     else:
-        ModelExecutor.autotune(executor)
+        ModelExecutor.autotune(executor, keep_loaded_tactics=False)
         assert events == [
             "load",
             ("group", None),
             "scrub",
             ("target", (32 if chunk_size < 0 else chunk_size)),
             *(
-                [("draft_experts", (32 if chunk_size < 0 else chunk_size))]
+                [
+                    ("draft_extend", (32 if chunk_size < 0 else chunk_size)),
+                    ("draft_experts", (32 if chunk_size < 0 else chunk_size)),
+                ]
                 if speculative
                 else []
             ),
@@ -524,7 +548,7 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
         lambda path, group, owner: events.append(("save", path, group, owner)),
     )
     _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
-    ModelExecutor.autotune(executor)
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     assert seen["input_ids"].tolist() == [2, 6, 10, 14]
     assert seen["positions"].tolist() == [20, 60, 100, 140]
     assert seen["rows"].tolist() == [2, 6, 10, 14] and seen["span"] == 16
@@ -598,7 +622,7 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         forward_step=_ForwardStepDouble(
             warmup_decode_path=warmup, max_decode_bs=8, max_tokens_per_req=3
         ),
-        drafter=object() if speculative else None,
+        drafter=_DrafterDouble(events) if speculative else None,
         model_input_kwargs=no_extend_inputs,
         events=events,
     )
@@ -634,9 +658,9 @@ def test_decode_only_attention_tunes_on_a_decode_step(
     )
     if failure:
         with pytest.raises(RuntimeError, match="decode warmup failed"):
-            ModelExecutor.autotune(executor)
+            ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     else:
-        ModelExecutor.autotune(executor)
+        ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     assert max_tokens == [8 * 3]
     assert events == [
         "load",
@@ -677,7 +701,7 @@ def test_pipeline_parallelism_does_not_run_unsupported_dummy_forward(
         model_input_kwargs=unexpected_forward,
         events=[],
     )
-    ModelExecutor.autotune(executor)
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     assert not tuning_module.is_warming_up()
 
 
@@ -853,12 +877,34 @@ class _ModelConfigDouble:
     quantization: str | None
 
 
+class _VendorPlatform:
+    """The test host's platform reporting another GPU vendor: server
+    arguments read other platform facts as well."""
+
+    def __init__(self, real, *, is_nvidia):
+        self._real = real
+        self.is_nvidia = is_nvidia
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _on_vendor(monkeypatch, *, is_nvidia):
+    real = server_args_module.current_platform()
+    monkeypatch.setattr(
+        server_args_module,
+        "current_platform",
+        lambda: _VendorPlatform(real, is_nvidia=is_nvidia),
+    )
+
+
 @pytest.mark.parametrize("tp,dp,max_num_seqs", [(8, 1, 4), (2, 4, 4), (2, 4, 7)])
 @pytest.mark.parametrize("disable_autotune", [False, True])
 @pytest.mark.parametrize("role", ["null", "decode"])
-def test_speculative_warmup_rejects_capacity_below_attention_tp(
-    tp, dp, max_num_seqs, disable_autotune, role
+def test_speculative_warmup_rejects_capacity_below_attention_tp_on_nvidia(
+    monkeypatch, tp, dp, max_num_seqs, disable_autotune, role
 ):
+    _on_vendor(monkeypatch, is_nvidia=True)
     with pytest.raises(ValueError, match=f"Set --max-num-seqs to at least {tp * dp}"):
         ServerArgs(
             model="x",
@@ -875,11 +921,23 @@ def test_speculative_warmup_rejects_capacity_below_attention_tp(
 
 
 @pytest.mark.parametrize(
-    "tp,dp,max_num_seqs", [(8, 1, 8), (2, 4, 8), (2, 4, 9), (1, 8, 8)]
+    "tp,dp,max_num_seqs,is_nvidia",
+    [
+        (8, 1, 8, True),
+        (2, 4, 8, True),
+        (2, 4, 9, True),
+        (1, 8, 8, True),
+        # Without FlashInfer's lockstep tuning, any cap is kept.
+        (8, 1, 1, False),
+        (8, 1, 4, False),
+        (2, 4, 4, False),
+        (2, 4, 7, False),
+    ],
 )
-def test_speculative_warmup_accepts_capacity_covering_attention_tp(
-    tp, dp, max_num_seqs
+def test_speculative_warmup_accepts_capacity(
+    monkeypatch, tp, dp, max_num_seqs, is_nvidia
 ):
+    _on_vendor(monkeypatch, is_nvidia=is_nvidia)
     args = ServerArgs(
         model="x",
         dtype="bfloat16",
@@ -1243,7 +1301,9 @@ def test_situ_shared_launcher_preserves_ep_routing_and_return_contract(
     )
     fi = _FiMoeDouble(output if finalize else deferred)
     monkeypatch.setattr(mxfp4_module, "trtllm_fp4_block_scale_moe", fi)
-    monkeypatch.setattr(mxfp4_module, "trtllm_fp4_block_scale_routed_moe", fi)
+    monkeypatch.setattr(
+        mxfp4_module, "tokenspeed_trtllm_fp4_block_scale_routed_moe", fi
+    )
     monkeypatch.setattr(tuning_module, "_autotune_max_num_tokens", 9216)
     w = _RoutedWeightsDouble()
     logits = torch.randn(3, 8, dtype=torch.bfloat16)

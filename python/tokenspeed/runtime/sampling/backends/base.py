@@ -40,11 +40,14 @@ from tokenspeed.runtime.execution.slot_state import (
 )
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+    from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -86,6 +89,9 @@ class SamplingBackendConfig:
     # ServerArgs.logprob_order). Behaviour-selecting, so no default either.
     logprob_order: str
 
+    # Only ascend_full applies the optional top-p candidate truncation.
+    npu_sampling_top_p_top_k_cap: bool = False
+
     enable_nan_detection: bool = False
 
     # Optional logprob features — OFF by default. These are checked at server
@@ -105,6 +111,8 @@ class SamplingBackendConfig:
     # rejection sampling). Required to keep RNG out of the CUDA graph.
     max_bs: int = 1
     max_draft_tokens_per_req: int = 1
+    # Sizing like max_bs: with draft trees (``ServerArgs.speculative_draft_tree``) a backend allocates and warms its tree verify; the ``tree`` argument of ``verify`` picks the rule.
+    draft_tree: bool = False
 
     # Sizing for backend-owned per-request state (e.g. token-count buffers
     # for penalties in FlashInferFullSamplingBackend). Indexed by req_pool_idx, not
@@ -124,6 +132,7 @@ class SamplingBackendConfig:
         cls,
         server_args: ServerArgs,
         *,
+        hf_config: PretrainedConfig,
         max_bs: int,
         max_draft_tokens_per_req: int,
         device: str,
@@ -132,11 +141,17 @@ class SamplingBackendConfig:
         vocab_size: int = 0,
         tp_group: tuple[int, ...] | None = None,
     ) -> SamplingBackendConfig:
+        npu_sampling_top_p_top_k_cap = getattr(
+            hf_config, "npu_sampling_top_p_top_k_cap", False
+        )
+        if not isinstance(npu_sampling_top_p_top_k_cap, bool):
+            raise ValueError("HF config npu_sampling_top_p_top_k_cap must be a boolean")
 
         return cls(
             synthetic_acceptance_length=server_args.synthetic_acceptance_length,
             sampling_stream=server_args.sampling_stream,
             logprob_order=server_args.logprob_order,
+            npu_sampling_top_p_top_k_cap=npu_sampling_top_p_top_k_cap,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
             enable_output_cumulative_probs=server_args.enable_output_cumulative_probs,
@@ -150,6 +165,7 @@ class SamplingBackendConfig:
             ),
             max_bs=max_bs,
             max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),
+            draft_tree=server_args.speculative_draft_tree,
             max_req_pool_size=max_req_pool_size,
             vocab_size=vocab_size,
             device=device,
@@ -221,8 +237,8 @@ class SamplingBackend(ABC):
         if config.synthetic_acceptance_length is not None:
             if not self._SUPPORTS_SYNTHETIC_ACCEPTANCE:
                 raise ValueError(
-                    "synthetic acceptance requires the greedy sampling backend, "
-                    "or the flashinfer backend with block rejection"
+                    "synthetic acceptance requires the greedy or sonic sampling "
+                    "backend, or the flashinfer backend over sampled drafts"
                 )
             al = config.synthetic_acceptance_length
             if not math.isfinite(al) or not 1 <= al <= config.max_draft_tokens_per_req:
@@ -393,6 +409,85 @@ class SamplingBackend(ABC):
         tree verify, as agreed across TP ranks."""
         return self._accept_index_buf[: bs * num_nodes].view(bs, num_nodes)
 
+    def vocab_shard_top_k(self) -> int | None:
+        """Most candidates per row this backend selects from vocabulary shards.
+
+        A backend returning a count reads a ``LogitsProcessorOutput`` whose
+        sampled rows stayed vocab-sharded (``vocab_shard``): it selects each
+        row's best candidates per shard where its route needs no more, and
+        gathers whole rows otherwise. None (the default) reads whole rows
+        only, so the processor gathers them.
+        """
+        return None
+
+    def supports_vocab_shard(
+        self, dtype: torch.dtype, columns: int, tp_size: int
+    ) -> bool:
+        """Whether this backend selects candidates from vocabulary shards of this geometry.
+
+        The default fits the shared shard selection (``vocab_shard_topk``) and
+        merge at ``vocab_shard_top_k`` candidates.
+
+        Args:
+            dtype: The shard logits' dtype, as the processor hands them over.
+            columns: Vocabulary columns per shard.
+            tp_size: Ranks the vocabulary is sharded over.
+        """
+        from tokenspeed_kernel.ops.sampling import (
+            vocab_shard_topk_supports,
+            vocab_topk_merge_supports,
+        )
+
+        top_k = self.vocab_shard_top_k()
+        return (
+            top_k is not None
+            and vocab_shard_topk_supports(dtype, columns, top_k)
+            and vocab_topk_merge_supports(tp_size, top_k)
+        )
+
+    def verifies_vocab_shard_draft_probs(self) -> bool:
+        """Whether ``verify`` takes ``draft_probs`` over each rank's vocabulary shard.
+
+        Under ``enable_speculative_sampling`` with sharded target logits, a
+        drafter whose head is sharded alike can then record each rank's
+        columns of ``q`` only (``[P, N, V / tp]``), and never gather its
+        logits. The default reads whole-vocabulary rows.
+        """
+        return False
+
+    def warmup_vocab_shard_sampling(
+        self,
+        shard: SampledVocabShard,
+        candidates: torch.Tensor,
+        *,
+        draft_q: DraftTreeQ | None,
+        with_vocab_mask: bool,
+        draft_probs: torch.Tensor | None,
+    ) -> None:
+        """Compile what ``sample`` and ``verify`` run on vocabulary shards.
+
+        A backend whose ``vocab_shard_top_k`` returns a count overrides it.
+        Startup calls it on every TP rank before serving.
+
+        Args:
+            shard: Shard logits of the processor that feeds this backend,
+                one row per column of ``candidates``.
+            candidates: One request's ``[1, N]`` verify window, in the dtype
+                and width the server verifies.
+            draft_q: The draft q every verify reads, or None when the server
+                verifies without one.
+            with_vocab_mask: Whether the server applies grammar masks.
+            draft_probs: The runtime's dense draft distributions every verify
+                reads (whole rows, or this rank's columns), or None.
+
+        Raises:
+            NotImplementedError: This backend reads whole rows only.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} reads whole rows only; it has no "
+            "vocab-shard sampling to warm"
+        )
+
     def reads_only_argmax(self) -> bool:
         """Whether ``sample`` and ``verify`` need nothing of the target logits
         but each row's argmax, which they then take from
@@ -418,8 +513,8 @@ class SamplingBackend(ABC):
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no draft-prob verify; "
-            "--enable-speculative-sampling needs the flashinfer or "
-            "flashinfer_full sampling backend (triton for DFLASH)"
+            "--enable-speculative-sampling needs the flashinfer, "
+            "flashinfer_full or sonic sampling backend (triton for DFLASH)"
         )
 
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:
